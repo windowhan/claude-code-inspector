@@ -90,6 +90,9 @@ async fn handle_inner(
     const HOP_BY_HOP: &[&str] = &[
         "host", "connection", "keep-alive", "transfer-encoding",
         "te", "trailers", "upgrade", "proxy-authorization", "proxy-authenticate",
+        // Strip accept-encoding so Anthropic returns uncompressed SSE.
+        // If we forward gzip, the raw_sse bytes are compressed and unparseable.
+        "accept-encoding",
     ];
 
     let headers = req.headers().clone();
