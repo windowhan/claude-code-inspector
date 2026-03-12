@@ -333,6 +333,7 @@ mod tests {
             status: "pending".to_string(),
             starred: false,
             memo: String::new(),
+            agent_type: "main".to_string(),
         }).unwrap();
         // Populate response fields (insert_request only stores base fields)
         db::update_request_complete(

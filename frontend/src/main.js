@@ -173,6 +173,7 @@ function renderRequests() {
     html += `<div class="${sel ? 'req-item selected' : 'req-item'}" data-rid="${r.id}">
       <div class="req-top">
         <span class="req-id" title="${r.id}">#${shortId}</span>
+        ${r.agent_type && r.agent_type !== 'main' ? `<span class="agent-badge agent-${r.agent_type}">${r.agent_type}</span>` : ''}
         <span class="badge ${color}">${esc(proj || 'unknown')}</span>
         <span class="req-time">${fmtTime(r.timestamp)}</span>
         <button class="star-btn ${r.starred ? 'starred' : ''}" data-star-rid="${r.id}" title="${r.starred ? 'Unstar' : 'Star'}">${r.starred ? '★' : '☆'}</button>
@@ -395,6 +396,7 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
   $detail.innerHTML = `
     <div class="detail-topbar">
       <span class="req-id" title="${req.id}">#${req.id.slice(0, 8)}</span>
+      ${req.agent_type && req.agent_type !== 'main' ? `<span class="agent-badge agent-${req.agent_type}">${req.agent_type}</span>` : ''}
       <span class="badge ${color}">${esc(proj || 'unknown')}</span>
       <span class="detail-method">${req.method} ${req.path}</span>
       <span class="detail-time">${fmtTime(req.timestamp)}</span>

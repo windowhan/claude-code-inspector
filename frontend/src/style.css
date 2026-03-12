@@ -159,6 +159,20 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .prev-messages-toggle:hover { background: var(--bg3); }
 .prev-messages.hidden { display: none; }
 .prev-messages { opacity: 0.6; }
+.agent-badge {
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.agent-explore { background: rgba(88,166,255,0.15); color: var(--blue); border: 1px solid rgba(88,166,255,0.3); }
+.agent-plan { background: rgba(210,153,34,0.15); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
+.agent-audit { background: rgba(248,81,73,0.15); color: var(--red, #f85149); border: 1px solid rgba(248,81,73,0.3); }
+.agent-sub { background: rgba(139,148,158,0.15); color: var(--text-muted); border: 1px solid rgba(139,148,158,0.3); }
+.agent-guide { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+.agent-statusline { background: rgba(163,113,247,0.15); color: #a371f7; border: 1px solid rgba(163,113,247,0.3); }
 .req-tag {
   font-size: 10px;
   padding: 1px 5px;

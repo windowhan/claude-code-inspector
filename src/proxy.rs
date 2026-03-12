@@ -134,11 +134,12 @@ async fn handle_inner(
     let mut body_bytes = req.into_body().collect().await?.to_bytes();
     let body_str = String::from_utf8_lossy(&body_bytes).to_string();
 
-    // Determine if streaming
-    let is_streaming = serde_json::from_str::<serde_json::Value>(&body_str)
-        .ok()
+    // Determine if streaming and detect agent type
+    let body_json = serde_json::from_str::<serde_json::Value>(&body_str).ok();
+    let is_streaming = body_json.as_ref()
         .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
         .unwrap_or(false);
+    let agent_type = detect_agent_type(&body_str);
 
     info!(
         request_id = %request_id,
@@ -168,6 +169,7 @@ async fn handle_inner(
         status: "pending".to_string(),
         starred: false,
         memo: String::new(),
+        agent_type: agent_type.clone(),
     };
 
     {
@@ -187,6 +189,7 @@ async fn handle_inner(
         "path": path,
         "timestamp": timestamp,
         "is_streaming": is_streaming,
+        "agent_type": agent_type,
     }));
 
     // ── Intercept checkpoint ─────────────────────────────────────────────────
@@ -460,6 +463,37 @@ fn emit_event(state: &AppState, event_type: &str, data: serde_json::Value) {
         data,
     };
     let _ = state.event_tx.send(event);
+}
+
+/// Detect agent type from request body by examining system prompts and model.
+fn detect_agent_type(body_str: &str) -> String {
+    // Check for known sub-agent system prompt signatures
+    if body_str.contains("Fast agent specialized for exploring") {
+        return "explore".to_string();
+    }
+    if body_str.contains("Software architect agent for designing") {
+        return "plan".to_string();
+    }
+    if body_str.contains("audit-context-building:function-analyzer")
+        || body_str.contains("Performs ultra-granular per-function deep analysis")
+    {
+        return "audit".to_string();
+    }
+    if body_str.contains("configure the user's Claude Code status line") {
+        return "statusline".to_string();
+    }
+    if body_str.contains("claude-code-guide") && body_str.contains("Claude Code (the CLI tool)") {
+        return "guide".to_string();
+    }
+    // Generic sub-agent detection: haiku model + short conversation = likely a sub-agent
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body_str) {
+        let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("");
+        let msg_count = v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
+        if model.contains("haiku") && msg_count <= 4 {
+            return "sub".to_string();
+        }
+    }
+    "main".to_string()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -885,5 +919,41 @@ mod tests {
         // No intercept map entries
         let map = state.intercepted.lock().unwrap();
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn detect_agent_type_main() {
+        let body = r#"{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hello"}]}"#;
+        assert_eq!(detect_agent_type(body), "main");
+    }
+
+    #[test]
+    fn detect_agent_type_explore() {
+        let body = r#"{"model":"claude-haiku","system":"Fast agent specialized for exploring codebases"}"#;
+        assert_eq!(detect_agent_type(body), "explore");
+    }
+
+    #[test]
+    fn detect_agent_type_plan() {
+        let body = r#"{"model":"claude-haiku","system":"Software architect agent for designing plans"}"#;
+        assert_eq!(detect_agent_type(body), "plan");
+    }
+
+    #[test]
+    fn detect_agent_type_audit() {
+        let body = r#"{"system":"Performs ultra-granular per-function deep analysis"}"#;
+        assert_eq!(detect_agent_type(body), "audit");
+    }
+
+    #[test]
+    fn detect_agent_type_sub_haiku_short() {
+        let body = r#"{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}]}"#;
+        assert_eq!(detect_agent_type(body), "sub");
+    }
+
+    #[test]
+    fn detect_agent_type_haiku_long_is_main() {
+        let body = r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"},{"role":"assistant","content":"d"},{"role":"user","content":"e"}]}"#;
+        assert_eq!(detect_agent_type(body), "main");
     }
 }
