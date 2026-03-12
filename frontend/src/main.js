@@ -143,6 +143,27 @@ function renderRequests() {
   })
 }
 
+function parseToolCallsFromSse(rawSse) {
+  const calls = []
+  for (const line of rawSse.split('\n')) {
+    if (!line.startsWith('data: ')) continue
+    try {
+      const d = JSON.parse(line.slice(6))
+      if (d.type === 'content_block_start' && d.content_block?.type === 'tool_use') {
+        calls.push({ name: d.content_block.name, _buf: '', input: {} })
+      } else if (d.type === 'content_block_delta' && d.delta?.type === 'input_json_delta') {
+        const last = calls[calls.length - 1]
+        if (last) last._buf += d.delta.partial_json || ''
+      }
+    } catch (_) {}
+  }
+  for (const c of calls) {
+    try { c.input = JSON.parse(c._buf) } catch (_) {}
+    delete c._buf
+  }
+  return calls
+}
+
 function renderDetail(req) {
   const proj  = sessions.find(s => s.id === req.session_id)?.project_name
   const color = projectColor(proj || 'unknown')
@@ -159,12 +180,44 @@ function renderDetail(req) {
   } catch (_) {}
 
   let respText = ''
+  let toolCalls = []
+  let rawRespJson = null
   if (req.response_body) {
     try {
       const rb = JSON.parse(req.response_body)
-      if (rb.accumulated_content) respText = rb.accumulated_content
-      else if (Array.isArray(rb.content)) respText = rb.content.map(c => c.text || '').join('')
+      if (rb.accumulated_content) {
+        respText = rb.accumulated_content
+      }
+      // Parse raw_sse for tool calls (tool_use type responses)
+      if (rb.raw_sse) {
+        toolCalls = parseToolCallsFromSse(rb.raw_sse)
+      }
+      // Non-streaming: extract content or keep as JSON
+      if (!rb.raw_sse && !rb.accumulated_content) {
+        rawRespJson = rb
+      }
     } catch (_) { respText = req.response_body }
+  }
+
+  // Build response content HTML
+  let respContentHtml = ''
+  if (respText) {
+    respContentHtml += `<div class="msg-block" style="margin-top:4px">
+      <div class="msg-role assistant">assistant</div>
+      <pre class="code resp-code">${esc(respText)}</pre>
+    </div>`
+  }
+  if (toolCalls.length > 0) {
+    respContentHtml += toolCalls.map(tc => `<div class="msg-block" style="margin-top:8px">
+      <div class="msg-role" style="color:#bc8cff">tool: ${esc(tc.name)}</div>
+      <pre class="code">${esc(JSON.stringify(tc.input, null, 2))}</pre>
+    </div>`).join('')
+  }
+  if (!respContentHtml && rawRespJson) {
+    respContentHtml = `<pre class="code resp-code">${esc(JSON.stringify(rawRespJson, null, 2))}</pre>`
+  }
+  if (!respContentHtml) {
+    respContentHtml = `<div class="empty-msg" style="padding:12px 0">${req.status === 'pending' ? 'Waiting…' : 'No content'}</div>`
   }
 
   // curl command
@@ -233,10 +286,7 @@ function renderDetail(req) {
             <span class="meta-label">Streaming</span>
             <span class="meta-val">${req.is_streaming ? 'yes' : 'no'}</span>
           </div>
-          ${respText ? `<div class="msg-block" style="margin-top:12px">
-            <div class="msg-role assistant">assistant</div>
-            <pre class="code resp-code">${esc(respText)}</pre>
-          </div>` : '<div class="empty-msg" style="padding:12px 0">No response yet</div>'}
+          ${respContentHtml}
         </div>
       </div>
     </div>
