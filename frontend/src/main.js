@@ -143,35 +143,86 @@ function renderRequests() {
   })
 }
 
-function parseToolCallsFromSse(rawSse) {
-  const calls = []
+/** Parse ALL content blocks from raw SSE in stream order. Returns [{type, text?, name?, input?}] */
+function parseSseBlocks(rawSse) {
+  const blocks = {}
+  let usage = {}
   for (const line of rawSse.split('\n')) {
     if (!line.startsWith('data: ')) continue
     try {
       const d = JSON.parse(line.slice(6))
-      if (d.type === 'content_block_start' && d.content_block?.type === 'tool_use') {
-        calls.push({ name: d.content_block.name, _buf: '', input: {} })
-      } else if (d.type === 'content_block_delta' && d.delta?.type === 'input_json_delta') {
-        const last = calls[calls.length - 1]
-        if (last) last._buf += d.delta.partial_json || ''
+      if (d.type === 'message_start') {
+        const u = d.message?.usage || {}
+        usage = { ...u }
+      }
+      if (d.type === 'message_delta' && d.usage) {
+        Object.assign(usage, d.usage)
+      }
+      if (d.type === 'content_block_start') {
+        blocks[d.index] = { type: d.content_block.type, name: d.content_block.name, _buf: '' }
+      }
+      if (d.type === 'content_block_delta') {
+        const b = blocks[d.index]
+        if (!b) continue
+        if (d.delta.type === 'text_delta')       b._buf += d.delta.text || ''
+        if (d.delta.type === 'input_json_delta') b._buf += d.delta.partial_json || ''
       }
     } catch (_) {}
   }
-  for (const c of calls) {
-    try { c.input = JSON.parse(c._buf) } catch (_) {}
-    delete c._buf
+  const ordered = Object.entries(blocks)
+    .sort(([a], [b]) => Number(a) - Number(b))
+    .map(([, b]) => {
+      if (b.type === 'text')     return { type: 'text', text: b._buf }
+      if (b.type === 'tool_use') {
+        let input = {}
+        try { input = JSON.parse(b._buf) } catch (_) { input = b._buf }
+        return { type: 'tool_use', name: b.name, input }
+      }
+      return { type: b.type, raw: b._buf }
+    })
+  return { blocks: ordered, usage }
+}
+
+/** Render a single content block item from a message's content array */
+function renderContentBlock(c) {
+  if (typeof c === 'string') return `<pre class="code cb-code">${esc(c)}</pre>`
+  switch (c.type) {
+    case 'text':
+      return `<pre class="code cb-code">${esc(c.text || '')}</pre>`
+    case 'tool_use':
+      return `<div class="cb-tool-use">
+        <div class="cb-label tool-use-label">call · ${esc(c.name)}</div>
+        <pre class="code cb-code">${esc(JSON.stringify(c.input || {}, null, 2))}</pre>
+      </div>`
+    case 'tool_result': {
+      const body = Array.isArray(c.content)
+        ? c.content.map(x => x.text || JSON.stringify(x)).join('\n')
+        : (c.content || '')
+      return `<div class="cb-tool-result">
+        <div class="cb-label tool-result-label">result · ${esc(c.tool_use_id || '')}</div>
+        <pre class="code cb-code">${esc(body)}</pre>
+      </div>`
+    }
+    default:
+      return `<pre class="code cb-code">${esc(JSON.stringify(c, null, 2))}</pre>`
   }
-  return calls
+}
+
+/** Render one message turn */
+function renderMsgBlock(m) {
+  const contentHtml = typeof m.content === 'string'
+    ? `<pre class="code cb-code">${esc(m.content)}</pre>`
+    : Array.isArray(m.content)
+      ? m.content.map(renderContentBlock).join('')
+      : `<pre class="code cb-code">${esc(JSON.stringify(m.content, null, 2))}</pre>`
+  return `<div class="msg-block"><div class="msg-role ${m.role}">${m.role}</div>${contentHtml}</div>`
 }
 
 function renderDetail(req) {
   const proj  = sessions.find(s => s.id === req.session_id)?.project_name
   const color = projectColor(proj || 'unknown')
 
-  let reqBody = {}
-  let messages = []
-  let model = ''
-  let systemMsg = null
+  let reqBody = {}, messages = [], model = '', systemMsg = null
   try {
     reqBody = JSON.parse(req.request_body)
     messages = reqBody.messages || []
@@ -179,46 +230,57 @@ function renderDetail(req) {
     systemMsg = reqBody.system || null
   } catch (_) {}
 
-  let respText = ''
-  let toolCalls = []
-  let rawRespJson = null
+  // Parse response
+  let sseBlocks = [], sseUsage = {}, rawRespJson = null
   if (req.response_body) {
     try {
       const rb = JSON.parse(req.response_body)
-      if (rb.accumulated_content) {
-        respText = rb.accumulated_content
-      }
-      // Parse raw_sse for tool calls (tool_use type responses)
       if (rb.raw_sse) {
-        toolCalls = parseToolCallsFromSse(rb.raw_sse)
-      }
-      // Non-streaming: extract content or keep as JSON
-      if (!rb.raw_sse && !rb.accumulated_content) {
+        const parsed = parseSseBlocks(rb.raw_sse)
+        sseBlocks = parsed.blocks
+        sseUsage  = parsed.usage
+      } else {
         rawRespJson = rb
       }
-    } catch (_) { respText = req.response_body }
+    } catch (_) {}
   }
 
-  // Build response content HTML
-  let respContentHtml = ''
-  if (respText) {
-    respContentHtml += `<div class="msg-block" style="margin-top:4px">
-      <div class="msg-role assistant">assistant</div>
-      <pre class="code resp-code">${esc(respText)}</pre>
-    </div>`
-  }
-  if (toolCalls.length > 0) {
-    respContentHtml += toolCalls.map(tc => `<div class="msg-block" style="margin-top:8px">
-      <div class="msg-role" style="color:#bc8cff">tool: ${esc(tc.name)}</div>
-      <pre class="code">${esc(JSON.stringify(tc.input, null, 2))}</pre>
-    </div>`).join('')
-  }
+  // Build response content HTML from SSE blocks
+  let respContentHtml = sseBlocks.map(b => {
+    if (b.type === 'text') {
+      return `<div class="msg-block">
+        <div class="msg-role assistant">text</div>
+        <pre class="code cb-code">${esc(b.text)}</pre>
+      </div>`
+    }
+    if (b.type === 'tool_use') {
+      return `<div class="msg-block">
+        <div class="cb-label tool-use-label">call · ${esc(b.name)}</div>
+        <pre class="code cb-code">${esc(JSON.stringify(b.input, null, 2))}</pre>
+      </div>`
+    }
+    return `<div class="msg-block"><pre class="code cb-code">${esc(JSON.stringify(b, null, 2))}</pre></div>`
+  }).join('')
+
   if (!respContentHtml && rawRespJson) {
-    respContentHtml = `<pre class="code resp-code">${esc(JSON.stringify(rawRespJson, null, 2))}</pre>`
+    respContentHtml = `<pre class="code cb-code">${esc(JSON.stringify(rawRespJson, null, 2))}</pre>`
   }
   if (!respContentHtml) {
     respContentHtml = `<div class="empty-msg" style="padding:12px 0">${req.status === 'pending' ? 'Waiting…' : 'No content'}</div>`
   }
+
+  // Usage stats from SSE (may include cache tokens)
+  const cacheIn  = sseUsage.cache_read_input_tokens
+  const cacheNew = sseUsage.cache_creation_input_tokens
+  const cacheHtml = (cacheIn || cacheNew) ? `
+    <div class="meta-row">
+      <span class="meta-label">Cache read</span>
+      <span class="meta-val">${cacheIn ?? 0}</span>
+    </div>
+    <div class="meta-row">
+      <span class="meta-label">Cache write</span>
+      <span class="meta-val">${cacheNew ?? 0}</span>
+    </div>` : ''
 
   // curl command
   let hdrs = {}
@@ -227,18 +289,10 @@ function renderDetail(req) {
   const curl  = `curl -X ${req.method} http://localhost:7878${req.path} \\\n${hArgs} \\\n  -H "x-api-key: $ANTHROPIC_API_KEY" \\\n  -d '${req.request_body.replace(/'/g, "'\\''")}'`
 
   const statusClass = req.status === 'complete' ? 'status-ok' : req.status === 'error' ? 'status-err' : 'status-pending'
-
-  // Build system message block if present
   const systemBlock = systemMsg ? `<div class="msg-block">
     <div class="msg-role system">system</div>
-    <pre class="code">${esc(typeof systemMsg === 'string' ? systemMsg : JSON.stringify(systemMsg, null, 2))}</pre>
+    <pre class="code cb-code">${esc(typeof systemMsg === 'string' ? systemMsg : JSON.stringify(systemMsg, null, 2))}</pre>
   </div>` : ''
-
-  // Build conversation messages
-  const msgBlocks = messages.map(m => `<div class="msg-block">
-    <div class="msg-role ${m.role}">${m.role}</div>
-    <pre class="code">${esc(typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2))}</pre>
-  </div>`).join('')
 
   $detail.innerHTML = `
     <div class="detail-topbar">
@@ -252,16 +306,10 @@ function renderDetail(req) {
       <div class="split-col">
         <div class="split-header">Request</div>
         <div class="split-body">
-          <div class="meta-row">
-            <span class="meta-label">Model</span>
-            <span class="meta-val">${esc(model || '-')}</span>
-          </div>
-          <div class="meta-row">
-            <span class="meta-label">Input tokens</span>
-            <span class="meta-val">${req.input_tokens ?? '-'}</span>
-          </div>
+          <div class="meta-row"><span class="meta-label">Model</span><span class="meta-val">${esc(model || '-')}</span></div>
+          <div class="meta-row"><span class="meta-label">Input tokens</span><span class="meta-val">${req.input_tokens ?? '-'}</span></div>
           ${systemBlock}
-          ${msgBlocks || '<div class="empty-msg" style="padding:12px 0">No messages</div>'}
+          ${messages.map(renderMsgBlock).join('') || '<div class="empty-msg" style="padding:12px 0">No messages</div>'}
         </div>
       </div>
 
@@ -270,22 +318,10 @@ function renderDetail(req) {
       <div class="split-col">
         <div class="split-header">Response</div>
         <div class="split-body">
-          <div class="meta-row">
-            <span class="meta-label">Status</span>
-            <span class="${statusClass}" style="font-weight:500">${req.response_status ?? '-'} ${req.status}</span>
-          </div>
-          <div class="meta-row">
-            <span class="meta-label">Output tokens</span>
-            <span class="meta-val">${req.output_tokens ?? '-'}</span>
-          </div>
-          <div class="meta-row">
-            <span class="meta-label">Duration</span>
-            <span class="meta-val">${fmtDuration(req.duration_ms) || '-'}</span>
-          </div>
-          <div class="meta-row">
-            <span class="meta-label">Streaming</span>
-            <span class="meta-val">${req.is_streaming ? 'yes' : 'no'}</span>
-          </div>
+          <div class="meta-row"><span class="meta-label">Status</span><span class="${statusClass}" style="font-weight:500">${req.response_status ?? '-'} ${req.status}</span></div>
+          <div class="meta-row"><span class="meta-label">Output tokens</span><span class="meta-val">${req.output_tokens ?? '-'}</span></div>
+          ${cacheHtml}
+          <div class="meta-row"><span class="meta-label">Duration</span><span class="meta-val">${fmtDuration(req.duration_ms) || '-'}</span></div>
           ${respContentHtml}
         </div>
       </div>

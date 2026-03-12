@@ -137,6 +137,13 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .meta-label { color: var(--text-muted); min-width: 90px; flex-shrink: 0; }
 .meta-val { color: var(--text-bright); font-weight: 500; }
 
+/* Content block styles */
+.cb-code { max-height: 300px; }
+.cb-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; padding: 2px 6px; border-radius: 3px; display: inline-block; }
+.tool-use-label { background: #2a1f3d; color: #bc8cff; }
+.tool-result-label { background: #1a2b1f; color: #56d364; }
+.cb-tool-use, .cb-tool-result { margin-bottom: 10px; }
+
 pre.code {
   background: var(--bg);
   border: 1px solid var(--border);
