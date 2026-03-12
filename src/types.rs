@@ -43,7 +43,8 @@ pub struct RequestRecord {
     pub status: String,  // pending | complete | error
     pub starred: bool,
     pub memo: String,
-    pub agent_type: String,  // "main", "explore", "plan", "audit", "sub" etc.
+    pub agent_type: String,   // "main", "explore", "plan", "audit", "sub" etc.
+    pub agent_task: String,   // short description of what the sub-agent is doing
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +147,7 @@ mod tests {
             starred: false,
             memo: String::new(),
             agent_type: "main".to_string(),
+            agent_task: String::new(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("pending"));

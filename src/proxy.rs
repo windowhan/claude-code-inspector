@@ -139,7 +139,7 @@ async fn handle_inner(
     let is_streaming = body_json.as_ref()
         .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
         .unwrap_or(false);
-    let agent_type = detect_agent_type(&body_str);
+    let (agent_type, agent_task) = detect_agent_type(&body_str);
 
     info!(
         request_id = %request_id,
@@ -170,6 +170,7 @@ async fn handle_inner(
         starred: false,
         memo: String::new(),
         agent_type: agent_type.clone(),
+        agent_task: agent_task.clone(),
     };
 
     {
@@ -190,6 +191,7 @@ async fn handle_inner(
         "timestamp": timestamp,
         "is_streaming": is_streaming,
         "agent_type": agent_type,
+        "agent_task": agent_task,
     }));
 
     // ── Intercept checkpoint ─────────────────────────────────────────────────
@@ -465,35 +467,85 @@ fn emit_event(state: &AppState, event_type: &str, data: serde_json::Value) {
     let _ = state.event_tx.send(event);
 }
 
-/// Detect agent type from request body by examining system prompts and model.
-fn detect_agent_type(body_str: &str) -> String {
-    // Check for known sub-agent system prompt signatures
-    if body_str.contains("Fast agent specialized for exploring") {
-        return "explore".to_string();
+/// Detect agent type and task description from request body.
+/// Returns (agent_type, agent_task).
+///
+/// Key distinction: the main agent has the Agent tool description in its system
+/// prompt (containing "Launch a new agent to handle complex"), while sub-agents
+/// do NOT have this tool. Sub-agent type is then refined by looking at their
+/// specific system prompt content.
+fn detect_agent_type(body_str: &str) -> (String, String) {
+    // Main agent always has the Agent tool available
+    let has_agent_tool = body_str.contains("Launch a new agent to handle complex");
+
+    if has_agent_tool {
+        return ("main".to_string(), String::new());
     }
-    if body_str.contains("Software architect agent for designing") {
-        return "plan".to_string();
-    }
-    if body_str.contains("audit-context-building:function-analyzer")
-        || body_str.contains("Performs ultra-granular per-function deep analysis")
-    {
-        return "audit".to_string();
-    }
-    if body_str.contains("configure the user's Claude Code status line") {
-        return "statusline".to_string();
-    }
-    if body_str.contains("claude-code-guide") && body_str.contains("Claude Code (the CLI tool)") {
-        return "guide".to_string();
-    }
-    // Generic sub-agent detection: haiku model + short conversation = likely a sub-agent
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body_str) {
-        let model = v.get("model").and_then(|m| m.as_str()).unwrap_or("");
-        let msg_count = v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
-        if model.contains("haiku") && msg_count <= 4 {
-            return "sub".to_string();
+
+    // This is a sub-agent — determine which kind
+    let agent_type = if body_str.contains("Fast agent specialized for exploring") {
+        "explore"
+    } else if body_str.contains("Software architect agent for designing") {
+        "plan"
+    } else if body_str.contains("Performs ultra-granular per-function deep analysis") {
+        "audit"
+    } else if body_str.contains("configure the user's Claude Code status line") {
+        "statusline"
+    } else if body_str.contains("Claude Code (the CLI tool)") && body_str.contains("claude-code-guide") {
+        "guide"
+    } else {
+        "sub"
+    };
+
+    let task = extract_agent_task(body_str);
+    (agent_type.to_string(), task)
+}
+
+/// Extract a short task description from the sub-agent's first user message.
+/// Skips <system-reminder> blocks to find the actual task prompt.
+fn extract_agent_task(body_str: &str) -> String {
+    let v = match serde_json::from_str::<serde_json::Value>(body_str) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let messages = match v.get("messages").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return String::new(),
+    };
+    // For sub-agents, the first user message contains the task
+    let user_msg = messages.iter().find(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("user")
+    });
+    let text = match user_msg {
+        Some(m) => {
+            if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+                s.to_string()
+            } else if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                // Find the last text block that isn't a system-reminder
+                arr.iter().rev()
+                    .filter_map(|b| {
+                        let t = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        if t.starts_with("<system-reminder>") || t.is_empty() {
+                            None
+                        } else {
+                            Some(t.to_string())
+                        }
+                    })
+                    .next()
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            }
         }
+        None => return String::new(),
+    };
+    // Trim and truncate to ~120 chars for display
+    let trimmed = text.trim();
+    if trimmed.len() <= 120 {
+        trimmed.to_string()
+    } else {
+        format!("{}…", &trimmed[..trimmed.char_indices().take(120).last().map(|(i,_)| i).unwrap_or(120)])
     }
-    "main".to_string()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -922,38 +974,51 @@ mod tests {
     }
 
     #[test]
-    fn detect_agent_type_main() {
-        let body = r#"{"model":"claude-opus-4-6","messages":[{"role":"user","content":"hello"}]}"#;
-        assert_eq!(detect_agent_type(body), "main");
+    fn detect_agent_type_main_has_agent_tool() {
+        let body = r#"{"model":"claude-opus","system":"Launch a new agent to handle complex tasks","messages":[{"role":"user","content":"hello"}]}"#;
+        assert_eq!(detect_agent_type(body).0, "main");
+    }
+
+    #[test]
+    fn detect_agent_type_main_even_with_explore_mention() {
+        // Main agent's system prompt mentions sub-agent types but also has Agent tool
+        let body = r#"{"system":"Launch a new agent to handle complex tasks. Fast agent specialized for exploring"}"#;
+        assert_eq!(detect_agent_type(body).0, "main");
     }
 
     #[test]
     fn detect_agent_type_explore() {
-        let body = r#"{"model":"claude-haiku","system":"Fast agent specialized for exploring codebases"}"#;
-        assert_eq!(detect_agent_type(body), "explore");
+        let body = r#"{"model":"claude-haiku","system":"Fast agent specialized for exploring codebases","messages":[{"role":"user","content":"find auth code"}]}"#;
+        let (t, task) = detect_agent_type(body);
+        assert_eq!(t, "explore");
+        assert_eq!(task, "find auth code");
     }
 
     #[test]
     fn detect_agent_type_plan() {
-        let body = r#"{"model":"claude-haiku","system":"Software architect agent for designing plans"}"#;
-        assert_eq!(detect_agent_type(body), "plan");
+        let body = r#"{"system":"Software architect agent for designing plans","messages":[{"role":"user","content":"plan the migration"}]}"#;
+        assert_eq!(detect_agent_type(body).0, "plan");
     }
 
     #[test]
     fn detect_agent_type_audit() {
-        let body = r#"{"system":"Performs ultra-granular per-function deep analysis"}"#;
-        assert_eq!(detect_agent_type(body), "audit");
+        let body = r#"{"system":"Performs ultra-granular per-function deep analysis","messages":[{"role":"user","content":"analyze crypto"}]}"#;
+        assert_eq!(detect_agent_type(body).0, "audit");
     }
 
     #[test]
-    fn detect_agent_type_sub_haiku_short() {
-        let body = r#"{"model":"claude-haiku-4-5-20251001","messages":[{"role":"user","content":"hi"}]}"#;
-        assert_eq!(detect_agent_type(body), "sub");
+    fn detect_agent_type_generic_sub() {
+        // No Agent tool, no known sub-agent keywords → generic sub
+        let body = r#"{"model":"claude-opus","messages":[{"role":"user","content":"write the report"}]}"#;
+        let (t, task) = detect_agent_type(body);
+        assert_eq!(t, "sub");
+        assert_eq!(task, "write the report");
     }
 
     #[test]
-    fn detect_agent_type_haiku_long_is_main() {
-        let body = r#"{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"},{"role":"assistant","content":"d"},{"role":"user","content":"e"}]}"#;
-        assert_eq!(detect_agent_type(body), "main");
+    fn detect_agent_task_skips_system_reminders() {
+        let body = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>ignore</system-reminder>"},{"type":"text","text":"actual task here"}]}]}"#;
+        let (_, task) = detect_agent_type(body);
+        assert_eq!(task, "actual task here");
     }
 }

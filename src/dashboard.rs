@@ -390,6 +390,7 @@ mod tests {
             starred: false,
             memo: String::new(),
             agent_type: "main".to_string(),
+            agent_task: String::new(),
         }).unwrap();
         // Populate the response fields (insert_request only stores base fields)
         db::update_request_complete(&db, req_id, 200, "{}", "{}", Some(5), Some(3), 100, "complete").unwrap();
@@ -677,6 +678,7 @@ mod tests {
                 starred: false,
                 memo: String::new(),
             agent_type: "main".to_string(),
+            agent_task: String::new(),
             }).unwrap();
         }
         seed_request(&state, "r-other", &sid);

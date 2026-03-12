@@ -164,8 +164,10 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   padding: 1px 5px;
   border-radius: 3px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.3px;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .agent-explore { background: rgba(88,166,255,0.15); color: var(--blue); border: 1px solid rgba(88,166,255,0.3); }
 .agent-plan { background: rgba(210,153,34,0.15); color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
