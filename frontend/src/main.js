@@ -1,5 +1,5 @@
 import { getSessions, getRequests, getRequestDetail, pollEvents, deleteSession, toggleStar } from './api.js'
-import { projectColor, fmtTime, fmtTokens, fmtDuration, esc, prettyJson, statusIcon } from './utils.js'
+import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let sessions = []
@@ -119,6 +119,7 @@ function renderRequests() {
         ${tok ? `<span>${tok}</span>` : ''}
         ${dur ? `<span>${dur}</span>` : ''}
         ${r.is_streaming ? '<span title="streaming" style="color:var(--text-muted)">~sse</span>' : ''}
+        <span class="req-sizes" title="req / resp size">${fmtBytes(r.request_body?.length)}→${fmtBytes(r.response_body?.length) || '…'}</span>
       </div>
     </div>`
   }

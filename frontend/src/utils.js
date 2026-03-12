@@ -18,6 +18,12 @@ export function fmtTokens(inp, out) {
   return `${inp != null ? f(inp) : '-'}↑ ${out != null ? f(out) : '-'}↓`
 }
 
+export function fmtBytes(n) {
+  if (!n) return ''
+  if (n < 1024) return `${n}b`
+  return `${(n / 1024).toFixed(1)}k`
+}
+
 export function fmtDuration(ms) {
   if (ms == null) return ''
   return ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms + 'ms'
