@@ -1,11 +1,11 @@
-import { getSessions, getRequests, getRequestDetail, pollEvents } from './api.js'
+import { getSessions, getRequests, getRequestDetail, pollEvents, deleteSession, toggleStar } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let sessions = []
 let requests = []
-let selectedSession = null   // null = all
-let selectedRequest = null   // id string
+let selectedSession = null        // null = all, '__starred__' = starred filter
+let selectedRequest = null        // id string
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 document.querySelector('#app').innerHTML = `
@@ -42,8 +42,13 @@ function renderSessions() {
   const active = sessions.filter(s => s.pending_count > 0).length
   $hMeta.textContent = `${sessions.length} session${sessions.length !== 1 ? 's' : ''}${active ? ` · ${active} active` : ''}`
 
-  const allClass = selectedSession === null ? 'session-item selected' : 'session-item'
-  let html = `<div class="${allClass}" data-sid="">
+  const starredClass = selectedSession === '__starred__' ? 'session-item selected' : 'session-item'
+  const allClass     = selectedSession === null ? 'session-item selected' : 'session-item'
+  let html = `
+  <div class="${starredClass}" data-sid="__starred__">
+    <div class="session-name"><span style="color:var(--yellow)">★</span> Starred</div>
+  </div>
+  <div class="${allClass}" data-sid="">
     <div class="session-name"><span class="sdot live"></span>All sessions</div>
   </div>`
 
@@ -56,6 +61,7 @@ function renderSessions() {
       <div class="session-name">
         <span class="sdot ${live ? 'live' : 'idle'}"></span>
         ${esc(s.project_name || 'unknown')}
+        <button class="session-del-btn" data-del-sid="${s.id}" title="Delete session">✕</button>
       </div>
       <div class="session-cwd">${esc(s.cwd || '')}</div>
       <div class="session-stats">${s.request_count} req${tokS}</div>
@@ -63,11 +69,28 @@ function renderSessions() {
   }
 
   $sessionList.innerHTML = html
+
+  // Session select
   $sessionList.querySelectorAll('[data-sid]').forEach(el => {
-    el.addEventListener('click', () => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-del-sid]')) return  // handled below
       selectedSession = el.dataset.sid || null
+      if (selectedSession === '') selectedSession = null
       renderSessions()
       loadRequests()
+    })
+  })
+
+  // Session delete buttons
+  $sessionList.querySelectorAll('[data-del-sid]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      const sid = btn.dataset.delSid
+      if (!confirm('Delete this session and all its requests?')) return
+      await deleteSession(sid)
+      if (selectedSession === sid) { selectedSession = null }
+      await loadSessions()
+      await loadRequests()
     })
   })
 }
@@ -89,6 +112,7 @@ function renderRequests() {
       <div class="req-top">
         <span class="badge ${color}">${esc(proj || 'unknown')}</span>
         <span class="req-time">${fmtTime(r.timestamp)}</span>
+        <button class="star-btn ${r.starred ? 'starred' : ''}" data-star-rid="${r.id}" title="${r.starred ? 'Unstar' : 'Star'}">${r.starred ? '★' : '☆'}</button>
       </div>
       <div class="req-bottom">
         ${statusIcon(r.status)}
@@ -100,10 +124,21 @@ function renderRequests() {
   }
   $reqList.innerHTML = html
   $reqList.querySelectorAll('[data-rid]').forEach(el => {
-    el.addEventListener('click', () => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('[data-star-rid]')) return
       selectedRequest = el.dataset.rid
       renderRequests()
       loadDetail(selectedRequest)
+    })
+  })
+  $reqList.querySelectorAll('[data-star-rid]').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      const rid = btn.dataset.starRid
+      const res = await toggleStar(rid)
+      const req = requests.find(r => r.id === rid)
+      if (req) req.starred = res.starred
+      renderRequests()
     })
   })
 }
@@ -225,7 +260,11 @@ async function loadSessions() {
 }
 
 async function loadRequests() {
-  requests = await getRequests(selectedSession)
+  if (selectedSession === '__starred__') {
+    requests = await getRequests(null, { starred: true })
+  } else {
+    requests = await getRequests(selectedSession)
+  }
   renderRequests()
 }
 

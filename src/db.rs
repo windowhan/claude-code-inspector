@@ -34,6 +34,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
     ")?;
+    // Migration: add starred column if not yet present (safe to run on existing DBs)
+    let _ = conn.execute(
+        "ALTER TABLE requests ADD COLUMN starred INTEGER NOT NULL DEFAULT 0", [],
+    );
     Ok(())
 }
 
@@ -108,6 +112,36 @@ pub fn update_request_complete(
     Ok(())
 }
 
+/// Delete a session and all its requests.
+pub fn delete_session(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM requests WHERE session_id = ?1", params![id])?;
+    conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Set the starred flag on a request.
+pub fn set_request_starred(conn: &Connection, id: &str, starred: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE requests SET starred = ?1 WHERE id = ?2",
+        params![starred as i32, id],
+    )?;
+    Ok(())
+}
+
+/// Returns all starred requests ordered by timestamp descending.
+pub fn get_starred_requests(conn: &Connection, limit: i64, offset: i64) -> Result<Vec<RequestRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                response_status, response_headers, response_body, is_streaming,
+                input_tokens, output_tokens, duration_ms, status, starred
+         FROM requests WHERE starred = 1
+         ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
+    )?;
+    let rows = stmt.query_map(params![limit, offset], map_request_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// Returns the most recently seen session ID for a given CWD, if any exists.
 /// Used to group subagents running from the same directory under one session.
 pub fn find_session_id_by_cwd(conn: &Connection, cwd: &str) -> Result<Option<String>> {
@@ -176,7 +210,7 @@ pub fn get_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status
+                    input_tokens, output_tokens, duration_ms, status, starred
              FROM requests WHERE session_id = ?1
              ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
         )?;
@@ -187,7 +221,7 @@ pub fn get_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status
+                    input_tokens, output_tokens, duration_ms, status, starred
              FROM requests
              ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         )?;
@@ -202,7 +236,7 @@ pub fn get_request_by_id(conn: &Connection, id: &str) -> Result<Option<RequestRe
     let mut stmt = conn.prepare(
         "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                 response_status, response_headers, response_body, is_streaming,
-                input_tokens, output_tokens, duration_ms, status
+                input_tokens, output_tokens, duration_ms, status, starred
          FROM requests WHERE id = ?1"
     )?;
     let mut rows = stmt.query_map(params![id], map_request_row)?;
@@ -226,6 +260,7 @@ fn map_request_row(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
         output_tokens: row.get(12)?,
         duration_ms: row.get(13)?,
         status: row.get(14)?,
+        starred: row.get::<_, i32>(15)? != 0,
     })
 }
 
@@ -270,6 +305,7 @@ mod tests {
             output_tokens: None,
             duration_ms: None,
             status: "pending".to_string(),
+            starred: false,
         }
     }
 
@@ -435,6 +471,64 @@ mod tests {
 
         let stats = get_session_stats(&conn).unwrap();
         assert_eq!(stats[0]["pending_count"], 1);
+    }
+
+    #[test]
+    fn delete_session_removes_session_and_requests() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        upsert_session(&conn, &sample_session("s2")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+        insert_request(&conn, &sample_request("r2", "s1")).unwrap();
+        insert_request(&conn, &sample_request("r3", "s2")).unwrap();
+
+        delete_session(&conn, "s1").unwrap();
+
+        let sessions = get_sessions(&conn).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "s2");
+
+        let reqs = get_requests(&conn, None, 10, 0).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].id, "r3");
+    }
+
+    #[test]
+    fn set_request_starred_and_get_starred() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+        insert_request(&conn, &sample_request("r2", "s1")).unwrap();
+
+        set_request_starred(&conn, "r1", true).unwrap();
+
+        let starred = get_starred_requests(&conn, 10, 0).unwrap();
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].id, "r1");
+        assert!(starred[0].starred);
+    }
+
+    #[test]
+    fn set_request_starred_toggle_off() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        set_request_starred(&conn, "r1", true).unwrap();
+        set_request_starred(&conn, "r1", false).unwrap();
+
+        let starred = get_starred_requests(&conn, 10, 0).unwrap();
+        assert!(starred.is_empty());
+    }
+
+    #[test]
+    fn get_starred_requests_empty_when_none_starred() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        let starred = get_starred_requests(&conn, 10, 0).unwrap();
+        assert!(starred.is_empty());
     }
 
     #[test]

@@ -19,17 +19,27 @@ pub async fn handle_dashboard(
     req: Request<hyper::body::Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let method = req.method().as_str().to_uppercase();
     let path  = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
-    Ok(match path.as_str() {
-        "/api/sessions" => serve_sessions(&state).await,
-        "/api/requests" => serve_requests(&state, &query).await,
-        p if p.starts_with("/api/requests/") => {
+    Ok(match (method.as_str(), path.as_str()) {
+        ("GET", "/api/sessions") => serve_sessions(&state).await,
+        ("DELETE", p) if p.starts_with("/api/sessions/") => {
+            serve_delete_session(&state, p.trim_start_matches("/api/sessions/")).await
+        }
+        ("GET", "/api/requests") => serve_requests(&state, &query).await,
+        ("POST", p) if p.starts_with("/api/requests/") && p.ends_with("/star") => {
+            let id = p.trim_start_matches("/api/requests/").trim_end_matches("/star");
+            serve_toggle_star(&state, id).await
+        }
+        ("GET", p) if p.starts_with("/api/requests/") => {
             serve_request_detail(&state, p.trim_start_matches("/api/requests/")).await
         }
-        "/events" => serve_sse(&state).await,
-        _ => serve_static(&path),
+        ("GET", "/events") => serve_sse(&state).await,
+        ("GET", _) => serve_static(&path),
+        _ => Response::builder().status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Full::new(Bytes::from("Method Not Allowed"))).unwrap(),
     })
 }
 
@@ -101,11 +111,40 @@ async fn serve_requests(state: &AppState, query: &str) -> Response<Full<Bytes>> 
     let session_id = params.get("session_id").map(|s| s.as_str());
     let limit      = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(50);
     let offset     = params.get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let starred    = params.get("starred").map(|v| v == "1" || v == "true").unwrap_or(false);
 
     let db = state.db.lock().await;
-    match db::get_requests(&db, session_id, limit, offset) {
-        Ok(r)  => json_response(serde_json::to_value(&r).unwrap_or_default()),
-        Err(e) => { warn!("get_requests: {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
+    if starred {
+        match db::get_starred_requests(&db, limit, offset) {
+            Ok(r)  => json_response(serde_json::to_value(&r).unwrap_or_default()),
+            Err(e) => { warn!("get_starred_requests: {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
+        }
+    } else {
+        match db::get_requests(&db, session_id, limit, offset) {
+            Ok(r)  => json_response(serde_json::to_value(&r).unwrap_or_default()),
+            Err(e) => { warn!("get_requests: {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
+        }
+    }
+}
+
+async fn serve_delete_session(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    match db::delete_session(&db, id) {
+        Ok(())  => json_response(serde_json::json!({"ok": true})),
+        Err(e) => { warn!("delete_session({id}): {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
+    }
+}
+
+async fn serve_toggle_star(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    let current = db::get_request_by_id(&db, id)
+        .ok()
+        .flatten()
+        .map(|r| r.starred)
+        .unwrap_or(false);
+    match db::set_request_starred(&db, id, !current) {
+        Ok(()) => json_response(serde_json::json!({"starred": !current})),
+        Err(e) => { warn!("set_request_starred({id}): {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
     }
 }
 
@@ -204,6 +243,7 @@ mod tests {
             output_tokens: None,
             duration_ms: None,
             status: "pending".to_string(),
+            starred: false,
         }).unwrap();
         // Populate the response fields (insert_request only stores base fields)
         db::update_request_complete(&db, req_id, 200, "{}", "{}", Some(5), Some(3), 100, "complete").unwrap();
@@ -387,6 +427,65 @@ mod tests {
             "*"
         );
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn serve_delete_session_removes_data() {
+        let state = make_state();
+        let sid = seed_session(&state);
+        seed_request(&state, "r1", &sid);
+        seed_request(&state, "r2", &sid);
+
+        let resp = serve_delete_session(&state, &sid).await;
+        assert_eq!(resp.status(), 200);
+        let bytes = resp_body_to_bytes(resp).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["ok"], true);
+
+        // Session and requests should be gone
+        let bytes = resp_body_to_bytes(serve_sessions(&state).await).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(arr.is_empty());
+
+        let bytes = resp_body_to_bytes(serve_requests(&state, "").await).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_toggle_star_stars_and_unstars() {
+        let state = make_state();
+        let sid = seed_session(&state);
+        seed_request(&state, "r1", &sid);
+
+        // Star it
+        let resp = serve_toggle_star(&state, "r1").await;
+        let bytes = resp_body_to_bytes(resp).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["starred"], true);
+
+        // Unstar it
+        let resp = serve_toggle_star(&state, "r1").await;
+        let bytes = resp_body_to_bytes(resp).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["starred"], false);
+    }
+
+    #[tokio::test]
+    async fn serve_requests_starred_filter() {
+        let state = make_state();
+        let sid = seed_session(&state);
+        seed_request(&state, "r1", &sid);
+        seed_request(&state, "r2", &sid);
+
+        // Star r1
+        serve_toggle_star(&state, "r1").await;
+
+        let bytes = resp_body_to_bytes(serve_requests(&state, "starred=1").await).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "r1");
+        assert_eq!(arr[0]["starred"], true);
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

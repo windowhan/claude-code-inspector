@@ -31,6 +31,7 @@ pub struct RequestRecord {
     pub output_tokens: Option<i64>,
     pub duration_ms: Option<i64>,
     pub status: String,  // pending | complete | error
+    pub starred: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -126,6 +127,7 @@ mod tests {
             output_tokens: None,
             duration_ms: None,
             status: "pending".to_string(),
+            starred: false,
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("pending"));

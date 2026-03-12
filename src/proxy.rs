@@ -144,6 +144,7 @@ async fn handle_inner(
         output_tokens: None,
         duration_ms: None,
         status: "pending".to_string(),
+        starred: false,
     };
 
     {

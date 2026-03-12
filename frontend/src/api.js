@@ -5,15 +5,29 @@ export async function getSessions() {
   return r.json()
 }
 
-export async function getRequests(sessionId, limit = 100, offset = 0) {
+export async function getRequests(sessionId, { starred = false, limit = 100, offset = 0 } = {}) {
   const params = new URLSearchParams({ limit, offset })
-  if (sessionId) params.set('session_id', sessionId)
+  if (starred) {
+    params.set('starred', '1')
+  } else if (sessionId) {
+    params.set('session_id', sessionId)
+  }
   const r = await fetch(`${BASE}/api/requests?${params}`)
   return r.json()
 }
 
 export async function getRequestDetail(id) {
   const r = await fetch(`${BASE}/api/requests/${id}`)
+  return r.json()
+}
+
+export async function deleteSession(id) {
+  const r = await fetch(`${BASE}/api/sessions/${id}`, { method: 'DELETE' })
+  return r.json()
+}
+
+export async function toggleStar(id) {
+  const r = await fetch(`${BASE}/api/requests/${id}/star`, { method: 'POST' })
   return r.json()
 }
 
