@@ -332,6 +332,7 @@ mod tests {
             duration_ms: None,
             status: "pending".to_string(),
             starred: false,
+            memo: String::new(),
         }).unwrap();
         // Populate response fields (insert_request only stores base fields)
         db::update_request_complete(

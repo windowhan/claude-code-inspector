@@ -55,6 +55,11 @@ pub async fn handle_dashboard(
             let id = p.trim_start_matches("/api/requests/").trim_end_matches("/star");
             full_to_box(serve_toggle_star(&state, id).await)
         }
+        ("POST", p) if p.starts_with("/api/requests/") && p.ends_with("/memo") => {
+            let id = p.trim_start_matches("/api/requests/").trim_end_matches("/memo");
+            let body = post_body.as_deref().unwrap_or(&[]);
+            full_to_box(serve_set_memo(&state, id, body).await)
+        }
         ("GET", p) if p.starts_with("/api/requests/") => {
             full_to_box(serve_request_detail(&state, p.trim_start_matches("/api/requests/")).await)
         }
@@ -190,6 +195,18 @@ async fn serve_toggle_star(state: &AppState, id: &str) -> Response<Full<Bytes>> 
     match db::set_request_starred(&db, id, !current) {
         Ok(()) => json_response(serde_json::json!({"starred": !current})),
         Err(e) => { warn!("set_request_starred({id}): {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
+    }
+}
+
+async fn serve_set_memo(state: &AppState, id: &str, body: &[u8]) -> Response<Full<Bytes>> {
+    let memo = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("memo").and_then(|m| m.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default();
+    let db = state.db.lock().await;
+    match db::set_request_memo(&db, id, &memo) {
+        Ok(()) => json_response(serde_json::json!({"memo": memo})),
+        Err(e) => { warn!("set_request_memo({id}): {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
     }
 }
 
@@ -371,6 +388,7 @@ mod tests {
             duration_ms: None,
             status: "pending".to_string(),
             starred: false,
+            memo: String::new(),
         }).unwrap();
         // Populate the response fields (insert_request only stores base fields)
         db::update_request_complete(&db, req_id, 200, "{}", "{}", Some(5), Some(3), 100, "complete").unwrap();
@@ -656,6 +674,7 @@ mod tests {
                 duration_ms: None,
                 status: "pending".to_string(),
                 starred: false,
+                memo: String::new(),
             }).unwrap();
         }
         seed_request(&state, "r-other", &sid);
@@ -762,6 +781,35 @@ mod tests {
         let state = make_state();
         let resp = serve_intercept_reject(&state, "nonexistent");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_set_memo_saves() {
+        let state = make_state();
+        let sid = seed_session(&state);
+        seed_request(&state, "r-memo", &sid);
+        let body = br#"{"memo":"hello world"}"#;
+        let resp = serve_set_memo(&state, "r-memo", body).await;
+        assert_eq!(resp.status(), 200);
+        let bytes = resp_body_to_bytes(resp).await;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["memo"], "hello world");
+        // Verify persisted
+        let db = state.db.lock().await;
+        let req = crate::db::get_request_by_id(&db, "r-memo").unwrap().unwrap();
+        assert_eq!(req.memo, "hello world");
+    }
+
+    #[tokio::test]
+    async fn serve_set_memo_empty_body() {
+        let state = make_state();
+        let sid = seed_session(&state);
+        seed_request(&state, "r-memo2", &sid);
+        let resp = serve_set_memo(&state, "r-memo2", b"{}").await;
+        assert_eq!(resp.status(), 200);
+        let bytes = resp_body_to_bytes(resp).await;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["memo"], "");
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

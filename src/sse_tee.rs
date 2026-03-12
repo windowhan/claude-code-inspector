@@ -55,6 +55,16 @@ impl Stream for SseTeeStream {
     }
 }
 
+impl Drop for SseTeeStream {
+    fn drop(&mut self) {
+        // If the stream is dropped before completing (e.g. client disconnect),
+        // still send whatever we've accumulated so the DB gets updated.
+        if let Some(tx) = self.done_tx.take() {
+            let _ = tx.send(std::mem::take(&mut self.buffer));
+        }
+    }
+}
+
 /// Parse accumulated SSE bytes and extract the combined text content.
 /// Returns `(accumulated_text, input_tokens, output_tokens)`.
 pub fn parse_sse_content(data: &[u8]) -> (String, Option<i64>, Option<i64>) {
@@ -107,8 +117,13 @@ pub fn parse_sse_content(data: &[u8]) -> (String, Option<i64>, Option<i64>) {
                         .get("message")
                         .and_then(|m| m.get("usage"))
                     {
-                        if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
-                            input_tokens = Some(inp);
+                        // Total input = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
+                        let base = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let cache_create = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let total_input = base + cache_create + cache_read;
+                        if total_input > 0 {
+                            input_tokens = Some(total_input);
                         }
                         if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
                             output_tokens = Some(out);
@@ -204,6 +219,14 @@ mod tests {
         let (_, inp, out) = parse_sse_content(sse);
         assert_eq!(inp, Some(42));
         assert_eq!(out, Some(0));
+    }
+
+    #[test]
+    fn parse_sse_includes_cache_tokens_in_input() {
+        let sse = b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":34,\"cache_creation_input_tokens\":1678,\"cache_read_input_tokens\":12511,\"output_tokens\":1}}}\n\n";
+        let (_, inp, out) = parse_sse_content(sse);
+        assert_eq!(inp, Some(34 + 1678 + 12511));  // 14223 total
+        assert_eq!(out, Some(1));
     }
 
     #[test]

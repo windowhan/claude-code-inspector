@@ -1,4 +1,4 @@
-import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest } from './api.js'
+import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -169,8 +169,10 @@ function renderRequests() {
     const tok   = fmtTokens(r.input_tokens, r.output_tokens)
     const dur   = fmtDuration(r.duration_ms)
     const sel   = r.id === selectedRequest
+    const shortId = r.id.slice(0, 8)
     html += `<div class="${sel ? 'req-item selected' : 'req-item'}" data-rid="${r.id}">
       <div class="req-top">
+        <span class="req-id" title="${r.id}">#${shortId}</span>
         <span class="badge ${color}">${esc(proj || 'unknown')}</span>
         <span class="req-time">${fmtTime(r.timestamp)}</span>
         <button class="star-btn ${r.starred ? 'starred' : ''}" data-star-rid="${r.id}" title="${r.starred ? 'Unstar' : 'Star'}">${r.starred ? '★' : '☆'}</button>
@@ -178,9 +180,9 @@ function renderRequests() {
       <div class="req-bottom">
         ${statusIcon(r.status)}
         ${tok ? `<span>${tok}</span>` : ''}
-        ${dur ? `<span>${dur}</span>` : ''}
-        ${r.is_streaming ? '<span title="streaming" style="color:var(--text-muted)">~sse</span>' : ''}
-        <span class="req-sizes" title="req / resp size">${fmtBytes(r.request_body?.length)}→${fmtBytes(r.response_body?.length) || '…'}</span>
+        ${dur ? `<span title="Response time">${dur}</span>` : ''}
+        ${r.is_streaming ? '<span class="req-tag streaming" title="Server-Sent Events streaming response">stream</span>' : '<span class="req-tag" title="Single JSON response">json</span>'}
+        ${r.memo ? `<span class="req-memo" title="${esc(r.memo)}">${esc(r.memo)}</span>` : ''}
       </div>
     </div>`
   }
@@ -273,16 +275,17 @@ function renderContentBlock(c) {
 }
 
 /** Render one message turn */
-function renderMsgBlock(m) {
+function renderMsgBlock(m, idx, time) {
   const contentHtml = typeof m.content === 'string'
     ? codeBlock(esc(m.content))
     : Array.isArray(m.content)
       ? m.content.map(renderContentBlock).join('')
       : codeBlock(esc(JSON.stringify(m.content, null, 2)))
-  return `<div class="msg-block"><div class="msg-role ${m.role}">${m.role}</div>${contentHtml}</div>`
+  const meta = idx != null ? `<span class="msg-num">#${idx + 1}${time ? ' · ' + time : ''}</span>` : ''
+  return `<div class="msg-block"><div class="msg-role ${m.role}">${meta}${m.role}</div>${contentHtml}</div>`
 }
 
-function renderDetail(req) {
+function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
   const proj  = sessions.find(s => s.id === req.session_id)?.project_name
   const color = projectColor(proj || 'unknown')
 
@@ -391,6 +394,7 @@ function renderDetail(req) {
 
   $detail.innerHTML = `
     <div class="detail-topbar">
+      <span class="req-id" title="${req.id}">#${req.id.slice(0, 8)}</span>
       <span class="badge ${color}">${esc(proj || 'unknown')}</span>
       <span class="detail-method">${req.method} ${req.path}</span>
       <span class="detail-time">${fmtTime(req.timestamp)}</span>
@@ -404,7 +408,8 @@ function renderDetail(req) {
           <div class="meta-row"><span class="meta-label">Model</span><span class="meta-val">${esc(model || '-')}</span></div>
           <div class="meta-row"><span class="meta-label">Input tokens</span><span class="meta-val">${req.input_tokens ?? '-'}</span></div>
           ${systemBlock}
-          ${messages.map(renderMsgBlock).join('') || '<div class="empty-msg" style="padding:12px 0">No messages</div>'}
+          ${prevMessageCount > 0 ? `<div class="prev-messages-toggle" id="prevMsgToggle">${prevMessageCount} previous messages hidden — click to show</div><div id="prevMsgContainer" class="prev-messages hidden">${messages.slice(0, prevMessageCount).map((m, i) => renderMsgBlock(m, i, fmtTime(msgTimestamps[i]))).join('')}</div>` : ''}
+          ${(prevMessageCount > 0 ? messages.slice(prevMessageCount) : messages).map((m, i) => { const gi = prevMessageCount > 0 ? prevMessageCount + i : i; return renderMsgBlock(m, gi, fmtTime(msgTimestamps[gi])) }).join('') || '<div class="empty-msg" style="padding:12px 0">No messages</div>'}
         </div>
       </div>
 
@@ -412,6 +417,15 @@ function renderDetail(req) {
 
       <div class="split-col">
         ${responseColumnHtml}
+      </div>
+    </div>
+
+    <div class="memo-section">
+      <div class="memo-header">Memo</div>
+      ${req.memo ? `<div class="memo-display" id="memoDisplay">${esc(req.memo)}</div>` : ''}
+      <div class="memo-form">
+        <input type="text" id="memoInput" class="memo-input" placeholder="Write a memo…" value="${esc(req.memo || '')}" />
+        <button class="btn btn-sm" id="memoSaveBtn">Save</button>
       </div>
     </div>
   `
@@ -424,6 +438,51 @@ function renderDetail(req) {
       document.execCommand('copy')
       document.body.removeChild(ta)
     })
+  })
+
+  // Previous messages toggle
+  const prevToggle = document.getElementById('prevMsgToggle')
+  if (prevToggle) {
+    prevToggle.addEventListener('click', () => {
+      const container = document.getElementById('prevMsgContainer')
+      const hidden = container.classList.toggle('hidden')
+      prevToggle.textContent = hidden
+        ? `${prevMessageCount} previous messages hidden — click to show`
+        : `${prevMessageCount} previous messages — click to hide`
+    })
+  }
+
+  // Memo save
+  const memoInput = document.getElementById('memoInput')
+  const memoSaveBtn = document.getElementById('memoSaveBtn')
+  const memoDisplay = document.getElementById('memoDisplay')
+  const saveMemo = async () => {
+    const val = memoInput.value.trim()
+    memoSaveBtn.disabled = true
+    memoSaveBtn.textContent = 'Saving…'
+    await setMemo(req.id, val)
+    memoSaveBtn.disabled = false
+    memoSaveBtn.textContent = 'Save'
+    memoInput.value = ''
+    // Update display
+    if (memoDisplay) {
+      memoDisplay.textContent = val
+      memoDisplay.style.display = val ? '' : 'none'
+    } else if (val) {
+      const d = document.createElement('div')
+      d.className = 'memo-display'
+      d.id = 'memoDisplay'
+      d.textContent = val
+      document.querySelector('.memo-form').before(d)
+    }
+    // Update request list memo badge
+    const r = requests.find(r => r.id === req.id)
+    if (r) r.memo = val
+    renderRequests()
+  }
+  memoSaveBtn.addEventListener('click', saveMemo)
+  memoInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveMemo() }
   })
 
   // Intercept action buttons
@@ -473,7 +532,65 @@ async function loadRequests() {
 
 async function loadDetail(id) {
   const req = await getRequestDetail(id)
-  renderDetail(req)
+
+  // Build per-message timestamp map by tracing session history.
+  // Each message index gets the timestamp of the request that first introduced it.
+  let prevMessageCount = 0
+  const msgTimestamps = [] // msgTimestamps[i] = timestamp string for message i
+
+  let currentMessages = []
+  try { currentMessages = JSON.parse(req.request_body).messages || [] } catch {}
+  const totalMessages = currentMessages.length
+
+  if (req.session_id) {
+    // Collect same-session requests older than (and including) current, sorted oldest→newest
+    const idx = requests.findIndex(r => r.id === id)
+    if (idx >= 0) {
+      const sessionReqs = requests
+        .slice(idx)  // idx and older (list is desc by time)
+        .filter(r => r.session_id === req.session_id)
+        .reverse()   // now oldest first
+
+      // Walk through each request to find when each message index first appeared
+      let prevCount = 0
+      for (const sr of sessionReqs) {
+        let detail, msgCount
+        if (sr.id === id) {
+          // Current request — no extra fetch needed
+          msgCount = totalMessages
+          detail = req
+        } else {
+          try {
+            detail = await getRequestDetail(sr.id)
+            const body = JSON.parse(detail.request_body)
+            msgCount = (body.messages || []).length
+          } catch { continue }
+        }
+        // Messages from prevCount to msgCount-1 were introduced by this request
+        for (let i = prevCount; i < msgCount; i++) {
+          msgTimestamps[i] = detail.timestamp
+        }
+        prevCount = msgCount
+      }
+
+      // prevMessageCount = messages from the request just before this one
+      const prevReq = requests.slice(idx + 1).find(r => r.session_id === req.session_id)
+      if (prevReq) {
+        try {
+          const prevDetail = await getRequestDetail(prevReq.id)
+          const prevBody = JSON.parse(prevDetail.request_body)
+          prevMessageCount = (prevBody.messages || []).length
+        } catch {}
+      }
+    }
+  }
+
+  // Fill any gaps (e.g. first request in session, or no history)
+  for (let i = 0; i < totalMessages; i++) {
+    if (!msgTimestamps[i]) msgTimestamps[i] = req.timestamp
+  }
+
+  renderDetail(req, prevMessageCount, msgTimestamps)
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────

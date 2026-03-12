@@ -24,15 +24,30 @@ pub async fn handle_request(
     peer_addr: SocketAddr,
     session_cache: SessionCache,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    match handle_inner(req, state, peer_addr, session_cache).await {
+    match handle_inner(req, Arc::clone(&state), peer_addr, session_cache).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
             error!("Proxy error: {e}");
+            // Try to mark any pending request as error using the error message
+            // (request_id is embedded in the error via context if available)
+            cleanup_pending_on_error(&state).await;
             Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Full::new(Bytes::from(format!("Proxy error: {e}"))))
                 .unwrap())
         }
+    }
+}
+
+/// Mark very recent pending requests as error when proxy encounters an unrecoverable error.
+/// This prevents requests from being stuck in pending state forever.
+async fn cleanup_pending_on_error(state: &AppState) {
+    let db = state.db.lock().await;
+    if let Err(e) = db.execute(
+        "UPDATE requests SET status = 'error' WHERE status = 'pending' AND timestamp > datetime('now', '-10 seconds')",
+        [],
+    ) {
+        warn!("Failed to cleanup pending requests: {e}");
     }
 }
 
@@ -152,6 +167,7 @@ async fn handle_inner(
         duration_ms: None,
         status: "pending".to_string(),
         starred: false,
+        memo: String::new(),
     };
 
     {
@@ -359,6 +375,8 @@ async fn handle_inner(
                 }
                 Err(e) => {
                     warn!("SSE done channel error: {e}");
+                    let db = state_clone.db.lock().await;
+                    let _ = db::update_request_status(&db, &request_id_clone, "error");
                 }
             }
         });
@@ -386,12 +404,13 @@ async fn handle_inner(
             serde_json::from_str::<serde_json::Value>(&resp_body_str)
                 .ok()
                 .map(|v| {
-                    let inp = v.get("usage")
-                        .and_then(|u| u.get("input_tokens"))
-                        .and_then(|t| t.as_i64());
-                    let out = v.get("usage")
-                        .and_then(|u| u.get("output_tokens"))
-                        .and_then(|t| t.as_i64());
+                    let usage = v.get("usage");
+                    let base = usage.and_then(|u| u.get("input_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
+                    let cache_create = usage.and_then(|u| u.get("cache_creation_input_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
+                    let cache_read = usage.and_then(|u| u.get("cache_read_input_tokens")).and_then(|t| t.as_i64()).unwrap_or(0);
+                    let total_input = base + cache_create + cache_read;
+                    let inp = if total_input > 0 { Some(total_input) } else { None };
+                    let out = usage.and_then(|u| u.get("output_tokens")).and_then(|t| t.as_i64());
                     (inp, out)
                 })
                 .unwrap_or((None, None));

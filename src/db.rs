@@ -38,6 +38,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute(
         "ALTER TABLE requests ADD COLUMN starred INTEGER NOT NULL DEFAULT 0", [],
     );
+    // Migration: add memo column
+    let _ = conn.execute(
+        "ALTER TABLE requests ADD COLUMN memo TEXT NOT NULL DEFAULT ''", [],
+    );
     Ok(())
 }
 
@@ -112,6 +116,14 @@ pub fn update_request_complete(
     Ok(())
 }
 
+pub fn set_request_memo(conn: &Connection, id: &str, memo: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE requests SET memo = ?1 WHERE id = ?2",
+        params![memo, id],
+    )?;
+    Ok(())
+}
+
 pub fn update_request_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
     conn.execute(
         "UPDATE requests SET status = ?1 WHERE id = ?2",
@@ -149,7 +161,7 @@ pub fn get_starred_requests(conn: &Connection, limit: i64, offset: i64) -> Resul
     let mut stmt = conn.prepare(
         "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                 response_status, response_headers, response_body, is_streaming,
-                input_tokens, output_tokens, duration_ms, status, starred
+                input_tokens, output_tokens, duration_ms, status, starred, memo
          FROM requests WHERE starred = 1
          ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
     )?;
@@ -227,7 +239,7 @@ pub fn get_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred
+                    input_tokens, output_tokens, duration_ms, status, starred, memo
              FROM requests WHERE session_id = ?1
              ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
         )?;
@@ -238,7 +250,7 @@ pub fn get_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred
+                    input_tokens, output_tokens, duration_ms, status, starred, memo
              FROM requests
              ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         )?;
@@ -261,7 +273,7 @@ pub fn search_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred
+                    input_tokens, output_tokens, duration_ms, status, starred, memo
              FROM requests
              WHERE session_id = ?1
                AND (request_body LIKE ?2 OR response_body LIKE ?2 OR path LIKE ?2)
@@ -274,7 +286,7 @@ pub fn search_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred
+                    input_tokens, output_tokens, duration_ms, status, starred, memo
              FROM requests
              WHERE request_body LIKE ?1 OR response_body LIKE ?1 OR path LIKE ?1
              ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
@@ -290,7 +302,7 @@ pub fn get_request_by_id(conn: &Connection, id: &str) -> Result<Option<RequestRe
     let mut stmt = conn.prepare(
         "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                 response_status, response_headers, response_body, is_streaming,
-                input_tokens, output_tokens, duration_ms, status, starred
+                input_tokens, output_tokens, duration_ms, status, starred, memo
          FROM requests WHERE id = ?1"
     )?;
     let mut rows = stmt.query_map(params![id], map_request_row)?;
@@ -315,6 +327,7 @@ fn map_request_row(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
         duration_ms: row.get(13)?,
         status: row.get(14)?,
         starred: row.get::<_, i32>(15)? != 0,
+        memo: row.get::<_, String>(16).unwrap_or_default(),
     })
 }
 
@@ -360,6 +373,7 @@ mod tests {
             duration_ms: None,
             status: "pending".to_string(),
             starred: false,
+            memo: String::new(),
         }
     }
 

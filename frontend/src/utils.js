@@ -15,7 +15,7 @@ export function fmtTime(iso) {
 export function fmtTokens(inp, out) {
   if (inp == null && out == null) return ''
   const f = n => n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n)
-  return `${inp != null ? f(inp) : '-'}↑ ${out != null ? f(out) : '-'}↓`
+  return `in ${inp != null ? f(inp) : '-'} / out ${out != null ? f(out) : '-'} tok`
 }
 
 export function fmtBytes(n) {

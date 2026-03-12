@@ -32,6 +32,15 @@ export async function toggleStar(id) {
   return r.json()
 }
 
+export async function setMemo(id, memo) {
+  const r = await fetch(`${BASE}/api/requests/${id}/memo`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ memo }),
+  })
+  return r.json()
+}
+
 // ── Intercept API ─────────────────────────────────────────────────────────────
 
 export async function getInterceptStatus() {
