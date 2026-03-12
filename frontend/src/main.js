@@ -37,6 +37,30 @@ const $reqCount    = document.getElementById('reqCount')
 const $reqList     = document.getElementById('reqList')
 const $detail      = document.getElementById('detail')
 
+// ── Copy button helper ─────────────────────────────────────────────────────────
+function codeBlock(content, extraClass = 'cb-code') {
+  return `<div class="code-wrap"><button class="copy-btn">Copy</button><pre class="code ${extraClass}">${content}</pre></div>`
+}
+
+$detail.addEventListener('click', e => {
+  const btn = e.target.closest('.copy-btn')
+  if (!btn) return
+  const pre = btn.closest('.code-wrap')?.querySelector('pre')
+  if (!pre) return
+  const text = pre.textContent
+  navigator.clipboard.writeText(text).catch(() => {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    document.body.removeChild(ta)
+  })
+  btn.textContent = 'Copied!'
+  btn.classList.add('copied')
+  setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied') }, 1500)
+})
+
 // ── Render ────────────────────────────────────────────────────────────────────
 function renderSessions() {
   const active = sessions.filter(s => s.pending_count > 0).length
@@ -186,14 +210,14 @@ function parseSseBlocks(rawSse) {
 
 /** Render a single content block item from a message's content array */
 function renderContentBlock(c) {
-  if (typeof c === 'string') return `<pre class="code cb-code">${esc(c)}</pre>`
+  if (typeof c === 'string') return codeBlock(esc(c))
   switch (c.type) {
     case 'text':
-      return `<pre class="code cb-code">${esc(c.text || '')}</pre>`
+      return codeBlock(esc(c.text || ''))
     case 'tool_use':
       return `<div class="cb-tool-use">
         <div class="cb-label tool-use-label">call · ${esc(c.name)}</div>
-        <pre class="code cb-code">${esc(JSON.stringify(c.input || {}, null, 2))}</pre>
+        ${codeBlock(esc(JSON.stringify(c.input || {}, null, 2)))}
       </div>`
     case 'tool_result': {
       const body = Array.isArray(c.content)
@@ -201,21 +225,21 @@ function renderContentBlock(c) {
         : (c.content || '')
       return `<div class="cb-tool-result">
         <div class="cb-label tool-result-label">result · ${esc(c.tool_use_id || '')}</div>
-        <pre class="code cb-code">${esc(body)}</pre>
+        ${codeBlock(esc(body))}
       </div>`
     }
     default:
-      return `<pre class="code cb-code">${esc(JSON.stringify(c, null, 2))}</pre>`
+      return codeBlock(esc(JSON.stringify(c, null, 2)))
   }
 }
 
 /** Render one message turn */
 function renderMsgBlock(m) {
   const contentHtml = typeof m.content === 'string'
-    ? `<pre class="code cb-code">${esc(m.content)}</pre>`
+    ? codeBlock(esc(m.content))
     : Array.isArray(m.content)
       ? m.content.map(renderContentBlock).join('')
-      : `<pre class="code cb-code">${esc(JSON.stringify(m.content, null, 2))}</pre>`
+      : codeBlock(esc(JSON.stringify(m.content, null, 2)))
   return `<div class="msg-block"><div class="msg-role ${m.role}">${m.role}</div>${contentHtml}</div>`
 }
 
@@ -251,20 +275,20 @@ function renderDetail(req) {
     if (b.type === 'text') {
       return `<div class="msg-block">
         <div class="msg-role assistant">text</div>
-        <pre class="code cb-code">${esc(b.text)}</pre>
+        ${codeBlock(esc(b.text))}
       </div>`
     }
     if (b.type === 'tool_use') {
       return `<div class="msg-block">
         <div class="cb-label tool-use-label">call · ${esc(b.name)}</div>
-        <pre class="code cb-code">${esc(JSON.stringify(b.input, null, 2))}</pre>
+        ${codeBlock(esc(JSON.stringify(b.input, null, 2)))}
       </div>`
     }
-    return `<div class="msg-block"><pre class="code cb-code">${esc(JSON.stringify(b, null, 2))}</pre></div>`
+    return `<div class="msg-block">${codeBlock(esc(JSON.stringify(b, null, 2)))}</div>`
   }).join('')
 
   if (!respContentHtml && rawRespJson) {
-    respContentHtml = `<pre class="code cb-code">${esc(JSON.stringify(rawRespJson, null, 2))}</pre>`
+    respContentHtml = codeBlock(esc(JSON.stringify(rawRespJson, null, 2)))
   }
   if (!respContentHtml) {
     respContentHtml = `<div class="empty-msg" style="padding:12px 0">${req.status === 'pending' ? 'Waiting…' : 'No content'}</div>`
@@ -292,7 +316,7 @@ function renderDetail(req) {
   const statusClass = req.status === 'complete' ? 'status-ok' : req.status === 'error' ? 'status-err' : 'status-pending'
   const systemBlock = systemMsg ? `<div class="msg-block">
     <div class="msg-role system">system</div>
-    <pre class="code cb-code">${esc(typeof systemMsg === 'string' ? systemMsg : JSON.stringify(systemMsg, null, 2))}</pre>
+    ${codeBlock(esc(typeof systemMsg === 'string' ? systemMsg : JSON.stringify(systemMsg, null, 2)))}
   </div>` : ''
 
   $detail.innerHTML = `
