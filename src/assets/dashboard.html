@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Inspector</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
+
+  header {
+    background: #161b22;
+    border-bottom: 1px solid #30363d;
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 { font-size: 15px; font-weight: 600; color: #f0f6fc; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .header-info { margin-left: auto; font-size: 12px; color: #8b949e; }
+
+  .layout { display: flex; flex: 1; overflow: hidden; }
+
+  /* Sidebar */
+  .sidebar {
+    width: 220px;
+    background: #161b22;
+    border-right: 1px solid #30363d;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+  .sidebar-title {
+    padding: 10px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border-bottom: 1px solid #21262d;
+  }
+  .session-item {
+    padding: 10px 14px;
+    cursor: pointer;
+    border-bottom: 1px solid #21262d;
+    transition: background 0.1s;
+  }
+  .session-item:hover { background: #1c2128; }
+  .session-item.active { background: #1f3451; border-left: 3px solid #388bfd; }
+  .session-name { font-size: 13px; font-weight: 500; color: #f0f6fc; display: flex; align-items: center; gap: 6px; }
+  .session-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .session-dot.active { background: #3fb950; }
+  .session-dot.idle { background: #8b949e; }
+  .session-cwd { font-size: 10px; color: #8b949e; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .session-stats { font-size: 11px; color: #8b949e; margin-top: 4px; }
+  .session-all { font-style: italic; color: #8b949e; }
+
+  /* Main content */
+  .main { flex: 1; display: flex; overflow: hidden; }
+
+  /* Request list */
+  .req-list { width: 380px; border-right: 1px solid #30363d; overflow-y: auto; flex-shrink: 0; }
+  .req-list-header { padding: 10px 14px; font-size: 11px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.08em; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 8px; }
+  .req-item {
+    padding: 10px 14px;
+    cursor: pointer;
+    border-bottom: 1px solid #21262d;
+    transition: background 0.1s;
+  }
+  .req-item:hover { background: #1c2128; }
+  .req-item.active { background: #1f3451; }
+  .req-item-top { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+  .badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .req-time { font-size: 11px; color: #8b949e; margin-left: auto; }
+  .req-item-bottom { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #8b949e; }
+  .status-icon { font-size: 13px; }
+  .tokens { font-size: 11px; }
+  .duration { font-size: 11px; }
+
+  /* Detail panel */
+  .detail { flex: 1; overflow-y: auto; padding: 16px; }
+  .detail-placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: #8b949e; font-size: 14px; }
+  .detail-section { margin-bottom: 20px; }
+  .detail-section h3 { font-size: 12px; font-weight: 600; color: #8b949e; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .detail-meta { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+  .meta-item { font-size: 12px; }
+  .meta-label { color: #8b949e; }
+  .meta-value { color: #f0f6fc; font-weight: 500; }
+  pre {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 12px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+    color: #c9d1d9;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+  .copy-btn {
+    background: #21262d;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .copy-btn:hover { background: #30363d; }
+  .empty-state { color: #8b949e; font-size: 13px; padding: 40px; text-align: center; }
+
+  /* Color palette for project badges */
+  .c0 { background: #1f3451; color: #79c0ff; }
+  .c1 { background: #1b2b1b; color: #56d364; }
+  .c2 { background: #2b1f1f; color: #ff7b72; }
+  .c3 { background: #2b2b1a; color: #e3b341; }
+  .c4 { background: #1f1f2b; color: #bc8cff; }
+  .c5 { background: #1a2b2b; color: #39d3d3; }
+  .c6 { background: #2b1f2b; color: #f778ba; }
+  .c7 { background: #2b2320; color: #ffa657; }
+</style>
+</head>
+<body>
+<header>
+  <div class="status-dot" id="statusDot"></div>
+  <h1>Claude Code Inspector</h1>
+  <div class="header-info" id="headerInfo">Connecting...</div>
+</header>
+<div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-title">Sessions</div>
+    <div id="sessionList"></div>
+  </div>
+  <div class="main">
+    <div class="req-list">
+      <div class="req-list-header">
+        <span>Requests</span>
+        <span id="reqCount" style="color:#8b949e;font-weight:400"></span>
+      </div>
+      <div id="requestList"></div>
+    </div>
+    <div class="detail" id="detailPanel">
+      <div class="detail-placeholder">Select a request to inspect</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const COLORS = ['c0','c1','c2','c3','c4','c5','c6','c7'];
+const projectColors = {};
+let colorIdx = 0;
+
+function projectColor(name) {
+  if (!name) return 'c0';
+  if (!projectColors[name]) {
+    projectColors[name] = COLORS[colorIdx % COLORS.length];
+    colorIdx++;
+  }
+  return projectColors[name];
+}
+
+function formatTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function formatTokens(inp, out) {
+  if (inp == null && out == null) return '';
+  const i = inp ? (inp >= 1000 ? (inp/1000).toFixed(1)+'k' : inp) : '-';
+  const o = out ? (out >= 1000 ? (out/1000).toFixed(1)+'k' : out) : '-';
+  return `${i}↑ ${o}↓`;
+}
+
+function statusIcon(status) {
+  switch(status) {
+    case 'complete': return '<span title="complete" style="color:#3fb950">✓</span>';
+    case 'error': return '<span title="error" style="color:#f85149">✗</span>';
+    case 'pending': return '<span title="pending" style="color:#e3b341">⏳</span>';
+    default: return '';
+  }
+}
+
+// State
+let sessions = [];
+let requests = [];
+let selectedSessionId = null;
+let selectedRequestId = null;
+
+async function loadSessions() {
+  const resp = await fetch('/api/sessions');
+  sessions = await resp.json();
+  renderSessions();
+  updateHeader();
+}
+
+async function loadRequests() {
+  const url = selectedSessionId
+    ? `/api/requests?session_id=${selectedSessionId}&limit=100`
+    : '/api/requests?limit=100';
+  const resp = await fetch(url);
+  requests = await resp.json();
+  renderRequests();
+}
+
+async function loadRequestDetail(id) {
+  const resp = await fetch(`/api/requests/${id}`);
+  const req = await resp.json();
+  renderDetail(req);
+}
+
+function updateHeader() {
+  const active = sessions.filter(s => s.pending_count > 0).length;
+  const total = sessions.length;
+  document.getElementById('headerInfo').textContent =
+    `${total} session${total !== 1 ? 's' : ''}${active > 0 ? ` · ${active} active` : ''}`;
+}
+
+function renderSessions() {
+  const container = document.getElementById('sessionList');
+
+  // "All" item
+  const allClass = selectedSessionId === null ? 'session-item active' : 'session-item';
+  let html = `<div class="${allClass} session-all" data-sid="">
+    <div class="session-name">All sessions</div>
+  </div>`;
+
+  for (const s of sessions) {
+    const isActive = s.pending_count > 0;
+    const dotClass = isActive ? 'active' : 'idle';
+    const itemClass = selectedSessionId === s.id ? 'session-item active' : 'session-item';
+    const tokens = (s.total_input_tokens + s.total_output_tokens);
+    const tokStr = tokens > 0 ? `${tokens >= 1000 ? (tokens/1000).toFixed(1)+'k' : tokens} tokens` : '';
+    html += `<div class="${itemClass}" data-sid="${s.id}">
+      <div class="session-name">
+        <span class="session-dot ${dotClass}"></span>
+        ${s.project_name || 'unknown'}
+      </div>
+      <div class="session-cwd">${s.cwd || ''}</div>
+      <div class="session-stats">${s.request_count} req${s.request_count !== 1 ? 's' : ''}${tokStr ? ' · ' + tokStr : ''}</div>
+    </div>`;
+  }
+
+  container.innerHTML = html;
+
+  container.querySelectorAll('[data-sid]').forEach(el => {
+    el.addEventListener('click', () => {
+      selectedSessionId = el.dataset.sid || null;
+      loadSessions();
+      loadRequests();
+    });
+  });
+}
+
+function renderRequests() {
+  const container = document.getElementById('requestList');
+  document.getElementById('reqCount').textContent = requests.length ? `(${requests.length})` : '';
+
+  if (!requests.length) {
+    container.innerHTML = '<div class="empty-state">No requests yet</div>';
+    return;
+  }
+
+  let html = '';
+  for (const r of requests) {
+    const project = r.session_id && sessions.find(s => s.id === r.session_id)?.project_name;
+    const color = projectColor(project || 'unknown');
+    const badgeText = project || 'unknown';
+    const tokStr = formatTokens(r.input_tokens, r.output_tokens);
+    const dur = r.duration_ms ? `${(r.duration_ms/1000).toFixed(1)}s` : '';
+    const activeClass = selectedRequestId === r.id ? ' active' : '';
+
+    html += `<div class="req-item${activeClass}" data-rid="${r.id}">
+      <div class="req-item-top">
+        <span class="badge ${color}">${badgeText}</span>
+        <span class="req-time">${formatTime(r.timestamp)}</span>
+      </div>
+      <div class="req-item-bottom">
+        ${statusIcon(r.status)}
+        <span class="tokens">${tokStr}</span>
+        ${dur ? `<span class="duration">${dur}</span>` : ''}
+        ${r.is_streaming ? '<span title="streaming" style="color:#8b949e">~</span>' : ''}
+      </div>
+    </div>`;
+  }
+
+  container.innerHTML = html;
+
+  container.querySelectorAll('[data-rid]').forEach(el => {
+    el.addEventListener('click', () => {
+      selectedRequestId = el.dataset.rid;
+      renderRequests();
+      loadRequestDetail(selectedRequestId);
+    });
+  });
+}
+
+function renderDetail(req) {
+  const panel = document.getElementById('detailPanel');
+  const project = req.session_id && sessions.find(s => s.id === req.session_id)?.project_name;
+  const color = projectColor(project || 'unknown');
+
+  let reqBody = {};
+  let messages = [];
+  let model = '';
+  try {
+    reqBody = JSON.parse(req.request_body);
+    messages = reqBody.messages || [];
+    model = reqBody.model || '';
+  } catch(e) {}
+
+  let respContent = '';
+  let respJson = null;
+  if (req.response_body) {
+    try {
+      respJson = JSON.parse(req.response_body);
+      if (respJson.accumulated_content) {
+        respContent = respJson.accumulated_content;
+      } else if (respJson.content && Array.isArray(respJson.content)) {
+        respContent = respJson.content.map(c => c.text || '').join('');
+      }
+    } catch(e) { respContent = req.response_body; }
+  }
+
+  // Build curl command
+  let reqHeaders = {};
+  try { reqHeaders = JSON.parse(req.request_headers); } catch(e) {}
+  const headerArgs = Object.entries(reqHeaders).map(([k,v]) => `-H "${k}: ${v}"`).join(' \\\n  ');
+  const curlCmd = `curl -X ${req.method} http://localhost:7878${req.path} \\\n  ${headerArgs} \\\n  -H "x-api-key: $ANTHROPIC_API_KEY" \\\n  -d '${req.request_body.replace(/'/g, "'\\''")}'`;
+
+  panel.innerHTML = `
+    <div class="detail-meta">
+      <div class="meta-item"><span class="meta-label">Project: </span><span class="meta-value"><span class="badge ${color}">${project || 'unknown'}</span></span></div>
+      <div class="meta-item"><span class="meta-label">Status: </span><span class="meta-value">${req.status}</span></div>
+      <div class="meta-item"><span class="meta-label">HTTP: </span><span class="meta-value">${req.response_status || '-'}</span></div>
+      <div class="meta-item"><span class="meta-label">Model: </span><span class="meta-value">${model || '-'}</span></div>
+      <div class="meta-item"><span class="meta-label">Tokens: </span><span class="meta-value">${formatTokens(req.input_tokens, req.output_tokens) || '-'}</span></div>
+      <div class="meta-item"><span class="meta-label">Duration: </span><span class="meta-value">${req.duration_ms ? (req.duration_ms/1000).toFixed(2)+'s' : '-'}</span></div>
+      <div class="meta-item"><span class="meta-label">Streaming: </span><span class="meta-value">${req.is_streaming ? 'yes' : 'no'}</span></div>
+      <div class="meta-item"><span class="meta-label">Time: </span><span class="meta-value">${formatTime(req.timestamp)}</span></div>
+    </div>
+
+    ${messages.length ? `
+    <div class="detail-section">
+      <h3>Messages (${messages.length})</h3>
+      ${messages.map(m => `
+        <div style="margin-bottom:8px">
+          <div style="font-size:11px;font-weight:600;color:${m.role === 'user' ? '#79c0ff' : '#56d364'};margin-bottom:4px;text-transform:uppercase">${m.role}</div>
+          <pre>${escHtml(typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2))}</pre>
+        </div>`).join('')}
+    </div>` : ''}
+
+    ${respContent ? `
+    <div class="detail-section">
+      <h3>Response</h3>
+      <pre>${escHtml(respContent)}</pre>
+    </div>` : ''}
+
+    ${req.request_body ? `
+    <div class="detail-section">
+      <h3>Request Body</h3>
+      <pre>${escHtml(tryPretty(req.request_body))}</pre>
+    </div>` : ''}
+
+    <div class="detail-section">
+      <h3>Copy as curl</h3>
+      <button class="copy-btn" onclick="copyText(${JSON.stringify(curlCmd)})">Copy curl command</button>
+    </div>
+  `;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function tryPretty(s) {
+  try { return JSON.stringify(JSON.parse(s), null, 2); } catch(e) { return s; }
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).catch(() => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  });
+}
+
+// Live updates via SSE polling (since we use Full<Bytes> body type)
+async function pollEvents() {
+  try {
+    const resp = await fetch('/events');
+    const text = await resp.text();
+    if (text.trim()) {
+      // Events arrived - refresh
+      await loadSessions();
+      await loadRequests();
+      if (selectedRequestId) {
+        await loadRequestDetail(selectedRequestId);
+      }
+    }
+  } catch(e) {}
+  setTimeout(pollEvents, 1500);
+}
+
+// Initial load
+async function init() {
+  await loadSessions();
+  await loadRequests();
+  pollEvents();
+}
+
+init();
+</script>
+</body>
+</html>
