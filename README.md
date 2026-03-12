@@ -22,6 +22,7 @@ Claude Code ──HTTP──▶ Proxy :7878 ──HTTPS──▶ api.anthropic.c
 |---|---------|--------|
 | 1 | **Request interceptor & editor** — Intercept a request mid-flight, modify the payload (model, messages, parameters), then forward the edited request to the upstream API | 🔲 Planned |
 | 2 | **Multi-provider routing** — Route specific requests to a different LLM provider (OpenAI, Gemini, Mistral, etc.) based on rules such as model name, session, or request content | 🔲 Planned |
+| 3 | **Supervisor agent** — A separate management agent that continuously reads the recorded request/response history and evaluates whether the ongoing session is heading in the right direction, flags missing steps, detects loops or regressions, and surfaces actionable feedback in real time | 🔲 Planned |
 
 ---
 
