@@ -1,8 +1,18 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::broadcast;
+use tokio::sync::oneshot;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
+
+#[derive(Debug)]
+pub enum InterceptAction {
+    ForwardOriginal,
+    ForwardModified { body: String },
+    Reject,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -44,6 +54,8 @@ pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub event_tx: broadcast::Sender<DashboardEvent>,
     pub upstream_url: String,
+    pub intercept_enabled: AtomicBool,
+    pub intercepted: std::sync::Mutex<HashMap<String, oneshot::Sender<InterceptAction>>>,
 }
 
 impl AppState {
@@ -62,6 +74,8 @@ impl AppState {
             db: Arc::new(Mutex::new(db)),
             event_tx,
             upstream_url,
+            intercept_enabled: AtomicBool::new(false),
+            intercepted: std::sync::Mutex::new(HashMap::new()),
         })
     }
 }

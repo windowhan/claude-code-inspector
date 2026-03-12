@@ -112,6 +112,22 @@ pub fn update_request_complete(
     Ok(())
 }
 
+pub fn update_request_status(conn: &Connection, id: &str, status: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE requests SET status = ?1 WHERE id = ?2",
+        params![status, id],
+    )?;
+    Ok(())
+}
+
+pub fn update_request_body(conn: &Connection, id: &str, body: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE requests SET request_body = ?1 WHERE id = ?2",
+        params![body, id],
+    )?;
+    Ok(())
+}
+
 /// Delete a session and all its requests.
 pub fn delete_session(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM requests WHERE session_id = ?1", params![id])?;
@@ -152,6 +168,7 @@ pub fn find_session_id_by_cwd(conn: &Connection, cwd: &str) -> Result<Option<Str
     Ok(rows.next().transpose()?)
 }
 
+#[allow(dead_code)]
 pub fn get_sessions(conn: &Connection) -> Result<Vec<SessionRecord>> {
     let mut stmt = conn.prepare(
         "SELECT id, pid, cwd, project_name, started_at, last_seen_at FROM sessions ORDER BY last_seen_at DESC"
@@ -226,6 +243,43 @@ pub fn get_requests(
              ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         )?;
         let x = stmt.query_map(params![limit, offset], map_request_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        x
+    };
+    Ok(rows)
+}
+
+pub fn search_requests(
+    conn: &Connection,
+    query: &str,
+    session_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<RequestRecord>> {
+    let pattern = format!("%{}%", query);
+    let rows = if let Some(sid) = session_id {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                    response_status, response_headers, response_body, is_streaming,
+                    input_tokens, output_tokens, duration_ms, status, starred
+             FROM requests
+             WHERE session_id = ?1
+               AND (request_body LIKE ?2 OR response_body LIKE ?2 OR path LIKE ?2)
+             ORDER BY timestamp DESC LIMIT ?3 OFFSET ?4"
+        )?;
+        let x = stmt.query_map(params![sid, pattern, limit, offset], map_request_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        x
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                    response_status, response_headers, response_body, is_streaming,
+                    input_tokens, output_tokens, duration_ms, status, starred
+             FROM requests
+             WHERE request_body LIKE ?1 OR response_body LIKE ?1 OR path LIKE ?1
+             ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
+        )?;
+        let x = stmt.query_map(params![pattern, limit, offset], map_request_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         x
     };
@@ -522,6 +576,71 @@ mod tests {
     }
 
     #[test]
+    fn search_requests_matches_request_body() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        let mut r1 = sample_request("r1", "s1");
+        r1.request_body = r#"{"model":"claude-haiku","messages":[]}"#.to_string();
+        let mut r2 = sample_request("r2", "s1");
+        r2.request_body = r#"{"model":"claude-sonnet","messages":[]}"#.to_string();
+        insert_request(&conn, &r1).unwrap();
+        insert_request(&conn, &r2).unwrap();
+
+        let results = search_requests(&conn, "haiku", None, 10, 0).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "r1");
+    }
+
+    #[test]
+    fn search_requests_matches_response_body() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+        super::update_request_complete(&conn, "r1", 200, "{}", r#"{"content":"hello world"}"#, None, None, 100, "complete").unwrap();
+
+        let results = search_requests(&conn, "hello world", None, 10, 0).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "r1");
+    }
+
+    #[test]
+    fn search_requests_matches_path() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        let results = search_requests(&conn, "/v1/messages", None, 10, 0).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn search_requests_no_match_returns_empty() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        let results = search_requests(&conn, "nonexistent-string-xyz", None, 10, 0).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_requests_with_session_filter() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        upsert_session(&conn, &sample_session("s2")).unwrap();
+        let mut r1 = sample_request("r1", "s1");
+        r1.request_body = r#"{"model":"claude-haiku"}"#.to_string();
+        let mut r2 = sample_request("r2", "s2");
+        r2.request_body = r#"{"model":"claude-haiku"}"#.to_string();
+        insert_request(&conn, &r1).unwrap();
+        insert_request(&conn, &r2).unwrap();
+
+        let results = search_requests(&conn, "haiku", Some("s1"), 10, 0).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "r1");
+    }
+
+    #[test]
     fn get_starred_requests_empty_when_none_starred() {
         let conn = setup();
         upsert_session(&conn, &sample_session("s1")).unwrap();
@@ -545,6 +664,33 @@ mod tests {
 
         let id = find_session_id_by_cwd(&conn, "/proj").unwrap();
         assert_eq!(id, Some("s2".to_string())); // most recent
+    }
+
+    #[test]
+    fn update_request_status_changes_status() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        update_request_status(&conn, "r1", "intercepted").unwrap();
+        let found = get_request_by_id(&conn, "r1").unwrap().unwrap();
+        assert_eq!(found.status, "intercepted");
+
+        update_request_status(&conn, "r1", "rejected").unwrap();
+        let found = get_request_by_id(&conn, "r1").unwrap().unwrap();
+        assert_eq!(found.status, "rejected");
+    }
+
+    #[test]
+    fn update_request_body_changes_body() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        let new_body = r#"{"model":"new-model","messages":[]}"#;
+        update_request_body(&conn, "r1", new_body).unwrap();
+        let found = get_request_by_id(&conn, "r1").unwrap().unwrap();
+        assert_eq!(found.request_body, new_body);
     }
 
     #[test]

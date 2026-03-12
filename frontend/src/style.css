@@ -69,6 +69,20 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 /* ── Request List ── */
 .req-panel { width: 360px; border-right: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
 .req-panel-header { padding: 8px 12px; font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--border2); display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.search-bar { padding: 6px 8px; border-bottom: 1px solid var(--border2); flex-shrink: 0; }
+.search-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 8px;
+  outline: none;
+  transition: border-color .15s;
+}
+.search-input:focus { border-color: var(--blue); }
+.search-input::placeholder { color: var(--text-muted); }
 .req-list { flex: 1; overflow-y: auto; }
 .req-item { padding: 9px 12px; cursor: pointer; border-bottom: 1px solid var(--border2); transition: background .1s; }
 .req-item:hover { background: var(--bg3); }
@@ -193,3 +207,48 @@ pre.resp-code { max-height: none; }
 .status-pending { color: var(--yellow); }
 
 .empty-msg { padding: 32px; text-align: center; color: var(--text-muted); font-size: 13px; }
+
+/* ── Intercept ── */
+.intercept-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+  margin-left: 8px;
+}
+.intercept-toggle:hover { background: var(--border); color: var(--text); }
+.intercept-toggle.active { border-color: var(--red); color: var(--red); background: rgba(248,81,73,.1); }
+.intercept-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; transition: background .15s; }
+.intercept-dot.off { background: var(--text-muted); }
+.intercept-dot.on { background: var(--red); animation: pulse 1.5s infinite; }
+
+.status-intercept { color: #e09b40; }
+
+.intercept-editor { margin-top: 10px; }
+.intercept-textarea {
+  width: 100%;
+  min-height: 300px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  padding: 10px 12px;
+  resize: vertical;
+  tab-size: 2;
+}
+.intercept-textarea:focus { outline: none; border-color: var(--blue); }
+.intercept-actions { display: flex; gap: 8px; margin-top: 10px; }
+.btn-primary { background: var(--blue-dim); border-color: var(--blue); color: #79c0ff; }
+.btn-primary:hover { background: var(--blue); color: #fff; }
+.btn-danger { background: rgba(248,81,73,.1); border-color: var(--red); color: var(--red); }
+.btn-danger:hover { background: var(--red); color: #fff; }

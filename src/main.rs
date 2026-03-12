@@ -1,5 +1,6 @@
 mod db;
 mod dashboard;
+mod intercept;
 mod mcp;
 mod proxy;
 mod session;

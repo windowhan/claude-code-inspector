@@ -41,7 +41,9 @@ export function prettyJson(s) {
 }
 
 export function statusIcon(status) {
-  if (status === 'complete') return '<span class="status-ok">✓</span>'
-  if (status === 'error')    return '<span class="status-err">✗</span>'
+  if (status === 'complete')    return '<span class="status-ok">✓</span>'
+  if (status === 'error')       return '<span class="status-err">✗</span>'
+  if (status === 'intercepted') return '<span class="status-intercept">⏸</span>'
+  if (status === 'rejected')    return '<span class="status-err">⊘</span>'
   return '<span class="status-pending">⏳</span>'
 }

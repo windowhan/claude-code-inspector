@@ -1,4 +1,4 @@
-import { getSessions, getRequests, getRequestDetail, pollEvents, deleteSession, toggleStar } from './api.js'
+import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -6,12 +6,19 @@ let sessions = []
 let requests = []
 let selectedSession = null        // null = all, '__starred__' = starred filter
 let selectedRequest = null        // id string
+let interceptEnabled = false
+let searchQuery = ''
+let searchDebounceTimer = null
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 document.querySelector('#app').innerHTML = `
 <header class="header">
   <div class="status-dot"></div>
   <span class="header-title">Claude Code Inspector</span>
+  <button class="intercept-toggle" id="interceptToggle" title="Toggle request interception">
+    <span class="intercept-dot" id="interceptDot"></span>
+    <span id="interceptLabel">Intercept</span>
+  </button>
   <span class="header-meta" id="hMeta">Loading…</span>
 </header>
 <div class="layout">
@@ -23,6 +30,9 @@ document.querySelector('#app').innerHTML = `
     <div class="req-panel-header">
       Requests <span id="reqCount" style="font-weight:400;color:var(--text-muted)"></span>
     </div>
+    <div class="search-bar">
+      <input type="text" id="searchInput" class="search-input" placeholder="Search requests…" />
+    </div>
     <div class="req-list" id="reqList"></div>
   </div>
   <div class="detail" id="detail">
@@ -31,11 +41,23 @@ document.querySelector('#app').innerHTML = `
 </div>
 `
 
+const $interceptToggle = document.getElementById('interceptToggle')
+const $interceptDot    = document.getElementById('interceptDot')
+const $interceptLabel  = document.getElementById('interceptLabel')
 const $hMeta       = document.getElementById('hMeta')
 const $sessionList = document.getElementById('sessionList')
 const $reqCount    = document.getElementById('reqCount')
 const $reqList     = document.getElementById('reqList')
 const $detail      = document.getElementById('detail')
+const $searchInput = document.getElementById('searchInput')
+
+$searchInput.addEventListener('input', () => {
+  clearTimeout(searchDebounceTimer)
+  searchDebounceTimer = setTimeout(() => {
+    searchQuery = $searchInput.value.trim()
+    loadRequests()
+  }, 300)
+})
 
 // ── Copy button helper ─────────────────────────────────────────────────────────
 function codeBlock(content, extraClass = 'cb-code') {
@@ -59,6 +81,19 @@ $detail.addEventListener('click', e => {
   btn.textContent = 'Copied!'
   btn.classList.add('copied')
   setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied') }, 1500)
+})
+
+// ── Intercept toggle ──────────────────────────────────────────────────────────
+function renderInterceptToggle() {
+  $interceptDot.className = `intercept-dot ${interceptEnabled ? 'on' : 'off'}`
+  $interceptLabel.textContent = interceptEnabled ? 'Intercept ON' : 'Intercept'
+  $interceptToggle.classList.toggle('active', interceptEnabled)
+}
+
+$interceptToggle.addEventListener('click', async () => {
+  const res = await toggleIntercept()
+  interceptEnabled = res.enabled
+  renderInterceptToggle()
 })
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -313,11 +348,42 @@ function renderDetail(req) {
   const hArgs = Object.entries(hdrs).map(([k, v]) => `  -H "${k}: ${v}"`).join(' \\\n')
   const curl  = `curl -X ${req.method} http://localhost:7878${req.path} \\\n${hArgs} \\\n  -H "x-api-key: $ANTHROPIC_API_KEY" \\\n  -d '${req.request_body.replace(/'/g, "'\\''")}'`
 
-  const statusClass = req.status === 'complete' ? 'status-ok' : req.status === 'error' ? 'status-err' : 'status-pending'
+  const statusClass = req.status === 'complete' ? 'status-ok' : req.status === 'error' ? 'status-err' : req.status === 'intercepted' ? 'status-intercept' : req.status === 'rejected' ? 'status-err' : 'status-pending'
   const systemBlock = systemMsg ? `<div class="msg-block">
     <div class="msg-role system">system</div>
     ${codeBlock(esc(typeof systemMsg === 'string' ? systemMsg : JSON.stringify(systemMsg, null, 2)))}
   </div>` : ''
+
+  // Build response column content based on status
+  let responseColumnHtml
+  if (req.status === 'intercepted') {
+    const prettyBody = (() => {
+      try { return JSON.stringify(JSON.parse(req.request_body), null, 2) } catch { return req.request_body }
+    })()
+    responseColumnHtml = `
+      <div class="split-header">Intercepted — Edit & Forward</div>
+      <div class="split-body">
+        <div class="meta-row"><span class="meta-label">Status</span><span class="status-intercept" style="font-weight:500">⏸ intercepted</span></div>
+        <div class="intercept-editor">
+          <textarea id="interceptBody" class="intercept-textarea" spellcheck="false">${esc(prettyBody)}</textarea>
+          <div class="intercept-actions">
+            <button class="btn" id="btnForwardOriginal">Forward Original</button>
+            <button class="btn btn-primary" id="btnForwardModified">Forward Modified</button>
+            <button class="btn btn-danger" id="btnReject">Reject</button>
+          </div>
+        </div>
+      </div>`
+  } else {
+    responseColumnHtml = `
+      <div class="split-header">Response</div>
+      <div class="split-body">
+        <div class="meta-row"><span class="meta-label">Status</span><span class="${statusClass}" style="font-weight:500">${req.response_status ?? '-'} ${req.status}</span></div>
+        <div class="meta-row"><span class="meta-label">Output tokens</span><span class="meta-val">${req.output_tokens ?? '-'}</span></div>
+        ${cacheHtml}
+        <div class="meta-row"><span class="meta-label">Duration</span><span class="meta-val">${fmtDuration(req.duration_ms) || '-'}</span></div>
+        ${respContentHtml}
+      </div>`
+  }
 
   $detail.innerHTML = `
     <div class="detail-topbar">
@@ -341,14 +407,7 @@ function renderDetail(req) {
       <div class="split-divider"></div>
 
       <div class="split-col">
-        <div class="split-header">Response</div>
-        <div class="split-body">
-          <div class="meta-row"><span class="meta-label">Status</span><span class="${statusClass}" style="font-weight:500">${req.response_status ?? '-'} ${req.status}</span></div>
-          <div class="meta-row"><span class="meta-label">Output tokens</span><span class="meta-val">${req.output_tokens ?? '-'}</span></div>
-          ${cacheHtml}
-          <div class="meta-row"><span class="meta-label">Duration</span><span class="meta-val">${fmtDuration(req.duration_ms) || '-'}</span></div>
-          ${respContentHtml}
-        </div>
+        ${responseColumnHtml}
       </div>
     </div>
   `
@@ -362,6 +421,35 @@ function renderDetail(req) {
       document.body.removeChild(ta)
     })
   })
+
+  // Intercept action buttons
+  if (req.status === 'intercepted') {
+    const refreshAfterAction = async () => {
+      // Wait briefly for proxy to complete upstream round-trip
+      await new Promise(r => setTimeout(r, 500))
+      await loadRequests()
+      await loadDetail(req.id)
+    }
+    document.getElementById('btnForwardOriginal').addEventListener('click', async (e) => {
+      e.target.disabled = true
+      e.target.textContent = 'Forwarding…'
+      await forwardOriginal(req.id)
+      await refreshAfterAction()
+    })
+    document.getElementById('btnForwardModified').addEventListener('click', async (e) => {
+      e.target.disabled = true
+      e.target.textContent = 'Forwarding…'
+      const body = document.getElementById('interceptBody').value
+      await forwardModified(req.id, body)
+      await refreshAfterAction()
+    })
+    document.getElementById('btnReject').addEventListener('click', async (e) => {
+      e.target.disabled = true
+      e.target.textContent = 'Rejecting…'
+      await rejectRequest(req.id)
+      await refreshAfterAction()
+    })
+  }
 }
 
 // ── Data loading ──────────────────────────────────────────────────────────────
@@ -374,7 +462,7 @@ async function loadRequests() {
   if (selectedSession === '__starred__') {
     requests = await getRequests(null, { starred: true })
   } else {
-    requests = await getRequests(selectedSession)
+    requests = await getRequests(selectedSession, { search: searchQuery })
   }
   renderRequests()
 }
@@ -386,12 +474,30 @@ async function loadDetail(id) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
+  // Load intercept status
+  try {
+    const res = await getInterceptStatus()
+    interceptEnabled = res.enabled
+    renderInterceptToggle()
+  } catch (_) {}
+
   await loadSessions()
   await loadRequests()
 
-  pollEvents(() => {
+  connectEvents((e) => {
     loadSessions()
     loadRequests()
+    // Auto-select intercepted requests
+    if (e.type === 'request_intercepted') {
+      try {
+        const d = JSON.parse(e.data)
+        if (d.data?.id) {
+          selectedRequest = d.data.id
+          loadDetail(selectedRequest)
+          return
+        }
+      } catch (_) {}
+    }
     if (selectedRequest) loadDetail(selectedRequest)
   })
 }

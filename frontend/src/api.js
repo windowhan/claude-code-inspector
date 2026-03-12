@@ -5,13 +5,14 @@ export async function getSessions() {
   return r.json()
 }
 
-export async function getRequests(sessionId, { starred = false, limit = 100, offset = 0 } = {}) {
+export async function getRequests(sessionId, { starred = false, search = '', limit = 100, offset = 0 } = {}) {
   const params = new URLSearchParams({ limit, offset })
   if (starred) {
     params.set('starred', '1')
   } else if (sessionId) {
     params.set('session_id', sessionId)
   }
+  if (search) params.set('search', search)
   const r = await fetch(`${BASE}/api/requests?${params}`)
   return r.json()
 }
@@ -31,15 +32,55 @@ export async function toggleStar(id) {
   return r.json()
 }
 
-/** Long-poll /events (100ms window) and call cb when data arrives */
-export function pollEvents(cb) {
-  async function loop() {
-    try {
-      const r = await fetch(`${BASE}/events`)
-      const text = await r.text()
-      if (text.trim()) cb(text)
-    } catch (_) {}
-    setTimeout(loop, 1500)
+// ── Intercept API ─────────────────────────────────────────────────────────────
+
+export async function getInterceptStatus() {
+  const r = await fetch(`${BASE}/api/intercept/status`)
+  return r.json()
+}
+
+export async function toggleIntercept() {
+  const r = await fetch(`${BASE}/api/intercept/toggle`, { method: 'POST' })
+  return r.json()
+}
+
+export async function getInterceptPending() {
+  const r = await fetch(`${BASE}/api/intercept/pending`)
+  return r.json()
+}
+
+export async function forwardOriginal(id) {
+  const r = await fetch(`${BASE}/api/intercept/${id}/forward`, { method: 'POST' })
+  return r.json()
+}
+
+export async function forwardModified(id, body) {
+  const r = await fetch(`${BASE}/api/intercept/${id}/forward-modified`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  })
+  return r.json()
+}
+
+export async function rejectRequest(id) {
+  const r = await fetch(`${BASE}/api/intercept/${id}/reject`, { method: 'POST' })
+  return r.json()
+}
+
+/** Connect to SSE stream and call cb on each event */
+export function connectEvents(cb) {
+  let es
+  function connect() {
+    es = new EventSource(`${BASE}/events`)
+    es.addEventListener('request_update', e => cb(e))
+    es.addEventListener('request_intercepted', e => cb(e))
+    es.addEventListener('session_update', e => cb(e))
+    es.onerror = () => {
+      es.close()
+      setTimeout(connect, 2000)
+    }
   }
-  loop()
+  connect()
+  return () => es?.close()
 }

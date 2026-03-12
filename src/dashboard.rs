@@ -2,12 +2,18 @@ use std::sync::Arc;
 use std::convert::Infallible;
 
 use bytes::Bytes;
-use http_body_util::Full;
+use futures::StreamExt;
+use http_body_util::{Full, BodyExt, StreamBody};
+use hyper::body::Frame;
 use hyper::{Request, Response, StatusCode};
 use tracing::warn;
 
 use crate::db;
-use crate::types::AppState;
+use crate::intercept;
+use crate::types::{AppState, InterceptAction};
+
+// A boxed body type that can be either Full<Bytes> or a streaming body
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
 /// Built frontend assets (populated by `npm run build` → `src/assets/dist/`)
 static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/assets/dist");
@@ -15,31 +21,64 @@ static DIST: include_dir::Dir<'_> = include_dir::include_dir!("$CARGO_MANIFEST_D
 /// Embedded single-file fallback dashboard (always compiled in)
 const FALLBACK_HTML: &str = include_str!("assets/dashboard.html");
 
+fn full_to_box(resp: Response<Full<Bytes>>) -> Response<BoxBody> {
+    resp.map(|b| b.map_err(|never| match never {}).boxed())
+}
+
 pub async fn handle_dashboard(
     req: Request<hyper::body::Incoming>,
     state: Arc<AppState>,
-) -> Result<Response<Full<Bytes>>, Infallible> {
+) -> Result<Response<BoxBody>, Infallible> {
     let method = req.method().as_str().to_uppercase();
     let path  = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
+    // Read body for POST requests that need it
+    let post_body = if method == "POST" {
+        let body = req.into_body().collect().await.ok()
+            .map(|b| b.to_bytes().to_vec())
+            .unwrap_or_default();
+        Some(body)
+    } else {
+        // Consume the body to avoid leaking the Incoming
+        drop(req);
+        None
+    };
+
     Ok(match (method.as_str(), path.as_str()) {
-        ("GET", "/api/sessions") => serve_sessions(&state).await,
+        ("GET", "/api/sessions") => full_to_box(serve_sessions(&state).await),
         ("DELETE", p) if p.starts_with("/api/sessions/") => {
-            serve_delete_session(&state, p.trim_start_matches("/api/sessions/")).await
+            full_to_box(serve_delete_session(&state, p.trim_start_matches("/api/sessions/")).await)
         }
-        ("GET", "/api/requests") => serve_requests(&state, &query).await,
+        ("GET", "/api/requests") => full_to_box(serve_requests(&state, &query).await),
         ("POST", p) if p.starts_with("/api/requests/") && p.ends_with("/star") => {
             let id = p.trim_start_matches("/api/requests/").trim_end_matches("/star");
-            serve_toggle_star(&state, id).await
+            full_to_box(serve_toggle_star(&state, id).await)
         }
         ("GET", p) if p.starts_with("/api/requests/") => {
-            serve_request_detail(&state, p.trim_start_matches("/api/requests/")).await
+            full_to_box(serve_request_detail(&state, p.trim_start_matches("/api/requests/")).await)
         }
-        ("GET", "/events") => serve_sse(&state).await,
-        ("GET", _) => serve_static(&path),
-        _ => Response::builder().status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(Full::new(Bytes::from("Method Not Allowed"))).unwrap(),
+        // Intercept API
+        ("GET", "/api/intercept/status") => full_to_box(serve_intercept_status(&state)),
+        ("POST", "/api/intercept/toggle") => full_to_box(serve_intercept_toggle(&state)),
+        ("GET", "/api/intercept/pending") => full_to_box(serve_intercept_pending(&state)),
+        ("POST", p) if p.starts_with("/api/intercept/") && p.ends_with("/forward") => {
+            let id = p.trim_start_matches("/api/intercept/").trim_end_matches("/forward");
+            full_to_box(serve_intercept_forward(&state, id))
+        }
+        ("POST", p) if p.starts_with("/api/intercept/") && p.ends_with("/forward-modified") => {
+            let id = p.trim_start_matches("/api/intercept/").trim_end_matches("/forward-modified");
+            let body = post_body.as_deref().unwrap_or(&[]);
+            full_to_box(serve_intercept_forward_modified(&state, id, body))
+        }
+        ("POST", p) if p.starts_with("/api/intercept/") && p.ends_with("/reject") => {
+            let id = p.trim_start_matches("/api/intercept/").trim_end_matches("/reject");
+            full_to_box(serve_intercept_reject(&state, id))
+        }
+        ("GET", "/events") => serve_sse_stream(&state),
+        ("GET", _) => full_to_box(serve_static(&path)),
+        _ => full_to_box(Response::builder().status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Full::new(Bytes::from("Method Not Allowed"))).unwrap()),
     })
 }
 
@@ -112,12 +151,18 @@ async fn serve_requests(state: &AppState, query: &str) -> Response<Full<Bytes>> 
     let limit      = params.get("limit").and_then(|v| v.parse::<i64>().ok()).unwrap_or(50);
     let offset     = params.get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
     let starred    = params.get("starred").map(|v| v == "1" || v == "true").unwrap_or(false);
+    let search     = params.get("search").cloned().unwrap_or_default();
 
     let db = state.db.lock().await;
     if starred {
         match db::get_starred_requests(&db, limit, offset) {
             Ok(r)  => json_response(serde_json::to_value(&r).unwrap_or_default()),
             Err(e) => { warn!("get_starred_requests: {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
+        }
+    } else if !search.is_empty() {
+        match db::search_requests(&db, &search, session_id, limit, offset) {
+            Ok(r)  => json_response(serde_json::to_value(&r).unwrap_or_default()),
+            Err(e) => { warn!("search_requests: {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
         }
     } else {
         match db::get_requests(&db, session_id, limit, offset) {
@@ -157,39 +202,121 @@ async fn serve_request_detail(state: &AppState, id: &str) -> Response<Full<Bytes
     }
 }
 
-async fn serve_sse(state: &AppState) -> Response<Full<Bytes>> {
-    let mut rx = state.event_tx.subscribe();
-    let mut events = Vec::new();
-
-    let timeout = tokio::time::sleep(tokio::time::Duration::from_millis(100));
-    tokio::pin!(timeout);
-    loop {
-        tokio::select! {
-            _ = &mut timeout => break,
-            result = rx.recv() => match result {
+fn serve_sse_stream(state: &AppState) -> Response<BoxBody> {
+    let rx = state.event_tx.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx)
+        .filter_map(|result| async {
+            match result {
                 Ok(ev) => {
                     let data = serde_json::to_string(&ev).unwrap_or_default();
-                    events.push(format!("event: {}\ndata: {}\n\n", ev.event_type, data));
+                    let chunk = format!("event: {}\ndata: {}\n\n", ev.event_type, data);
+                    Some(Ok(Frame::data(Bytes::from(chunk))))
                 }
-                Err(_) => break,
+                Err(_) => None, // lagged — skip
             }
-        }
-    }
-
+        });
+    let body = StreamBody::new(stream).map_err(|never: Infallible| match never {}).boxed();
     Response::builder()
         .status(200)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .header("access-control-allow-origin", "*")
-        .body(Full::new(Bytes::from(events.join(""))))
+        .body(body)
         .unwrap()
+}
+
+// ── Intercept handlers ────────────────────────────────────────────────────────
+
+fn serve_intercept_status(state: &AppState) -> Response<Full<Bytes>> {
+    let enabled = intercept::should_intercept(state);
+    json_response(serde_json::json!({ "enabled": enabled }))
+}
+
+fn serve_intercept_toggle(state: &AppState) -> Response<Full<Bytes>> {
+    let new_state = intercept::toggle(state);
+    json_response(serde_json::json!({ "enabled": new_state }))
+}
+
+fn serve_intercept_pending(state: &AppState) -> Response<Full<Bytes>> {
+    // Need Arc for list_pending; we wrap in a temporary Arc reference
+    // Actually, list_pending takes &Arc<AppState>, but we only have &AppState here.
+    // We'll access the mutex directly.
+    let map = state.intercepted.lock().unwrap();
+    let ids: Vec<String> = map.keys().cloned().collect();
+    json_response(serde_json::json!(ids))
+}
+
+fn serve_intercept_forward(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    let mut map = state.intercepted.lock().unwrap();
+    if let Some(sender) = map.remove(id) {
+        let _ = sender.send(InterceptAction::ForwardOriginal);
+        json_response(serde_json::json!({ "ok": true }))
+    } else {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
+            .body(Full::new(Bytes::from(r#"{"error":"request not found or already resolved"}"#)))
+            .unwrap()
+    }
+}
+
+fn serve_intercept_forward_modified(state: &AppState, id: &str, body: &[u8]) -> Response<Full<Bytes>> {
+    let body_str = String::from_utf8_lossy(body).to_string();
+    let mut map = state.intercepted.lock().unwrap();
+    if let Some(sender) = map.remove(id) {
+        let _ = sender.send(InterceptAction::ForwardModified { body: body_str });
+        json_response(serde_json::json!({ "ok": true }))
+    } else {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
+            .body(Full::new(Bytes::from(r#"{"error":"request not found or already resolved"}"#)))
+            .unwrap()
+    }
+}
+
+fn serve_intercept_reject(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    let mut map = state.intercepted.lock().unwrap();
+    if let Some(sender) = map.remove(id) {
+        let _ = sender.send(InterceptAction::Reject);
+        json_response(serde_json::json!({ "ok": true }))
+    } else {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
+            .body(Full::new(Bytes::from(r#"{"error":"request not found or already resolved"}"#)))
+            .unwrap()
+    }
+}
+
+fn url_decode(s: &str) -> String {
+    let s = s.replace('+', " ");
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                result.push(byte as char);
+            } else {
+                result.push('%');
+                result.push_str(&hex);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
     q.split('&').filter_map(|part| {
         let mut it = part.splitn(2, '=');
-        let k = it.next()?.to_string();
-        let v = it.next().unwrap_or("").to_string();
+        let k = url_decode(it.next()?);
+        let v = url_decode(it.next().unwrap_or(""));
         if k.is_empty() { None } else { Some((k, v)) }
     }).collect()
 }
@@ -337,36 +464,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn serve_sse_returns_empty_when_no_events() {
+    #[test]
+    fn serve_sse_stream_returns_event_stream_headers() {
         let state = make_state();
-        let resp = serve_sse(&state).await;
+        let resp = serve_sse_stream(&state);
         assert_eq!(resp.status(), 200);
         let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
         assert!(ct.contains("text/event-stream"));
-        let bytes = resp_body_to_bytes(resp).await;
-        // No events in the 100ms window → empty body
-        assert!(bytes.is_empty());
+        assert_eq!(resp.headers().get("cache-control").unwrap(), "no-cache");
+        assert_eq!(resp.headers().get("access-control-allow-origin").unwrap(), "*");
     }
 
     #[tokio::test]
-    async fn serve_sse_delivers_events() {
+    async fn serve_sse_stream_delivers_events() {
+        use http_body_util::BodyExt;
         let state = make_state();
         let tx = state.event_tx.clone();
+        let resp = serve_sse_stream(&state);
+        let mut body = resp.into_body();
 
-        // Send from a spawned task with a small delay so serve_sse can subscribe first
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _ = tx.send(DashboardEvent {
-                event_type: "request_update".to_string(),
-                data: serde_json::json!({"id": "x"}),
-            });
-        });
+        // Send an event after subscribing
+        tx.send(DashboardEvent {
+            event_type: "request_update".to_string(),
+            data: serde_json::json!({"id": "x"}),
+        }).unwrap();
 
-        // serve_sse subscribes then waits 100ms; the event arrives at ~10ms
-        let resp = serve_sse(&state).await;
-        let bytes = resp_body_to_bytes(resp).await;
-        let text = String::from_utf8(bytes).unwrap();
+        // Read the first frame with a timeout
+        let frame = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            body.frame(),
+        ).await.unwrap().unwrap().unwrap();
+
+        let data = frame.into_data().unwrap();
+        let text = String::from_utf8(data.to_vec()).unwrap();
         assert!(text.contains("request_update"));
         assert!(text.contains("event:"));
         assert!(text.contains("data:"));
@@ -417,6 +547,20 @@ mod tests {
         let map = parse_query("&valid=yes&");
         assert_eq!(map.len(), 1);
         assert_eq!(map["valid"], "yes");
+    }
+
+    #[test]
+    fn parse_query_decodes_plus_and_percent() {
+        let map = parse_query("search=hello+world&foo=bar%20baz");
+        assert_eq!(map["search"], "hello world");
+        assert_eq!(map["foo"], "bar baz");
+    }
+
+    #[test]
+    fn url_decode_handles_special_chars() {
+        assert_eq!(url_decode("A+specific+feature"), "A specific feature");
+        assert_eq!(url_decode("100%25"), "100%");
+        assert_eq!(url_decode("no+encoding"), "no encoding");
     }
 
     #[test]
@@ -486,6 +630,138 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"], "r1");
         assert_eq!(arr[0]["starred"], true);
+    }
+
+    #[tokio::test]
+    async fn serve_requests_with_search() {
+        let state = make_state();
+        let sid = seed_session(&state);
+        // seed_request inserts with body "{}" — let's insert one with custom body
+        {
+            let db = state.db.try_lock().unwrap();
+            db::insert_request(&db, &RequestRecord {
+                id: "r-search".to_string(),
+                session_id: Some(sid.clone()),
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/messages".to_string(),
+                request_headers: "{}".to_string(),
+                request_body: r#"{"model":"claude-haiku","messages":[]}"#.to_string(),
+                response_status: None,
+                response_headers: None,
+                response_body: None,
+                is_streaming: false,
+                input_tokens: None,
+                output_tokens: None,
+                duration_ms: None,
+                status: "pending".to_string(),
+                starred: false,
+            }).unwrap();
+        }
+        seed_request(&state, "r-other", &sid);
+
+        let bytes = resp_body_to_bytes(serve_requests(&state, "search=haiku").await).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "r-search");
+    }
+
+    #[tokio::test]
+    async fn serve_requests_search_no_match() {
+        let state = make_state();
+        let sid = seed_session(&state);
+        seed_request(&state, "r1", &sid);
+
+        let bytes = resp_body_to_bytes(serve_requests(&state, "search=nonexistent").await).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(arr.is_empty());
+    }
+
+    // ── Intercept tests ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn serve_intercept_status_default_disabled() {
+        let state = make_state();
+        let bytes = resp_body_to_bytes(serve_intercept_status(&state)).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn serve_intercept_toggle_enables() {
+        let state = make_state();
+        let bytes = resp_body_to_bytes(serve_intercept_toggle(&state)).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["enabled"], true);
+
+        let bytes = resp_body_to_bytes(serve_intercept_toggle(&state)).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["enabled"], false);
+    }
+
+    #[tokio::test]
+    async fn serve_intercept_pending_empty() {
+        let state = make_state();
+        let bytes = resp_body_to_bytes(serve_intercept_pending(&state)).await;
+        let arr: Vec<String> = serde_json::from_slice(&bytes).unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn serve_intercept_forward_not_found() {
+        let state = make_state();
+        let resp = serve_intercept_forward(&state, "nonexistent");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_intercept_forward_resolves() {
+        let state = make_state();
+        let rx = crate::intercept::register(&state, "r1");
+        let resp = serve_intercept_forward(&state, "r1");
+        assert_eq!(resp.status(), 200);
+        let action = rx.await.unwrap();
+        assert!(matches!(action, crate::types::InterceptAction::ForwardOriginal));
+    }
+
+    #[tokio::test]
+    async fn serve_intercept_forward_modified_resolves() {
+        let state = make_state();
+        let rx = crate::intercept::register(&state, "r2");
+        let body = br#"{"model":"new"}"#;
+        let resp = serve_intercept_forward_modified(&state, "r2", body);
+        assert_eq!(resp.status(), 200);
+        let action = rx.await.unwrap();
+        match action {
+            crate::types::InterceptAction::ForwardModified { body: b } => {
+                assert_eq!(b, r#"{"model":"new"}"#);
+            }
+            _ => panic!("expected ForwardModified"),
+        }
+    }
+
+    #[test]
+    fn serve_intercept_forward_modified_not_found() {
+        let state = make_state();
+        let resp = serve_intercept_forward_modified(&state, "nonexistent", b"{}");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_intercept_reject_resolves() {
+        let state = make_state();
+        let rx = crate::intercept::register(&state, "r3");
+        let resp = serve_intercept_reject(&state, "r3");
+        assert_eq!(resp.status(), 200);
+        let action = rx.await.unwrap();
+        assert!(matches!(action, crate::types::InterceptAction::Reject));
+    }
+
+    #[test]
+    fn serve_intercept_reject_not_found() {
+        let state = make_state();
+        let resp = serve_intercept_reject(&state, "nonexistent");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

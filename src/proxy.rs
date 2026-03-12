@@ -13,9 +13,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::db;
+use crate::intercept;
 use crate::session::{resolve_session, SessionCache};
 use crate::sse_tee::{parse_sse_content, SseTeeStream};
-use crate::types::{AppState, DashboardEvent, RequestRecord, SessionRecord};
+use crate::types::{AppState, DashboardEvent, InterceptAction, RequestRecord, SessionRecord};
 
 pub async fn handle_request(
     req: Request<hyper::body::Incoming>,
@@ -93,6 +94,9 @@ async fn handle_inner(
         // Strip accept-encoding so Anthropic returns uncompressed SSE.
         // If we forward gzip, the raw_sse bytes are compressed and unparseable.
         "accept-encoding",
+        // Strip content-length so reqwest recalculates it from the actual body.
+        // Essential when intercept modifies the body to a different size.
+        "content-length",
     ];
 
     let headers = req.headers().clone();
@@ -112,7 +116,7 @@ async fn handle_inner(
     }
 
     // Read request body
-    let body_bytes = req.into_body().collect().await?.to_bytes();
+    let mut body_bytes = req.into_body().collect().await?.to_bytes();
     let body_str = String::from_utf8_lossy(&body_bytes).to_string();
 
     // Determine if streaming
@@ -168,6 +172,85 @@ async fn handle_inner(
         "timestamp": timestamp,
         "is_streaming": is_streaming,
     }));
+
+    // ── Intercept checkpoint ─────────────────────────────────────────────────
+    if intercept::should_intercept(&state) {
+        // Update DB status to intercepted
+        {
+            let db = state.db.lock().await;
+            let _ = db::update_request_status(&db, &request_id, "intercepted");
+        }
+
+        // Emit intercepted event
+        emit_event(&state, "request_intercepted", serde_json::json!({
+            "id": request_id,
+            "session_id": session_id,
+            "project_name": session_info.project_name,
+            "status": "intercepted",
+            "method": method.to_string(),
+            "path": path,
+            "timestamp": timestamp,
+            "is_streaming": is_streaming,
+            "request_body": body_str,
+        }));
+
+        // Register and wait for user decision (60s timeout)
+        let rx = intercept::register(&state, &request_id);
+        let action = match tokio::time::timeout(
+            tokio::time::Duration::from_secs(60),
+            rx,
+        ).await {
+            Ok(Ok(action)) => action,
+            Ok(Err(_)) => {
+                warn!(request_id = %request_id, "Intercept channel dropped, forwarding original");
+                InterceptAction::ForwardOriginal
+            }
+            Err(_) => {
+                warn!(request_id = %request_id, "Intercept timeout (60s), forwarding original");
+                // Clean up the sender from the map
+                let mut map = state.intercepted.lock().unwrap();
+                map.remove(&request_id);
+                InterceptAction::ForwardOriginal
+            }
+        };
+
+        match action {
+            InterceptAction::ForwardOriginal => {
+                // Continue with original body_bytes
+            }
+            InterceptAction::ForwardModified { body } => {
+                // Update DB with modified body
+                {
+                    let db = state.db.lock().await;
+                    let _ = db::update_request_body(&db, &request_id, &body);
+                }
+                body_bytes = Bytes::from(body);
+            }
+            InterceptAction::Reject => {
+                // Update DB status to rejected
+                {
+                    let db = state.db.lock().await;
+                    let _ = db::update_request_status(&db, &request_id, "rejected");
+                }
+                emit_event(&state, "request_update", serde_json::json!({
+                    "id": request_id,
+                    "session_id": session_id,
+                    "project_name": session_info.project_name,
+                    "status": "rejected",
+                }));
+                return Ok(Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Full::new(Bytes::from(r#"{"error":"Request rejected by inspector"}"#)))
+                    .unwrap());
+            }
+        }
+
+        // Restore status to pending for normal flow
+        {
+            let db = state.db.lock().await;
+            let _ = db::update_request_status(&db, &request_id, "pending");
+        }
+    }
 
     // Forward to upstream (URL from AppState — configurable for testing)
     let upstream_url = format!("{}{path}", state.upstream_url);
@@ -595,5 +678,193 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), 502);
+    }
+
+    // ── Intercept test helpers ──────────────────────────────────────────────
+
+    /// Wait until at least one request appears in the intercept map.
+    async fn wait_for_intercept(state: &Arc<AppState>) {
+        for _ in 0..50 {
+            {
+                let map = state.intercepted.lock().unwrap();
+                if !map.is_empty() { return; }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        panic!("Timed out waiting for intercepted request");
+    }
+
+    // ── Intercept tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn intercept_forward_original_passes_to_upstream() {
+        let upstream = spawn_mock_upstream(|| (200, "application/json", MOCK_JSON_BODY)).await;
+        let (proxy_url, state) = spawn_proxy(upstream).await;
+
+        // Enable intercept
+        state.intercept_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Spawn the proxy request in background
+        let proxy_url_clone = proxy_url.clone();
+        let client_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{proxy_url_clone}/v1/messages"))
+                .header("content-type", "application/json")
+                .body(r#"{"model":"claude","messages":[],"max_tokens":1}"#)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        // Wait for the request to be intercepted
+        wait_for_intercept(&state).await;
+
+        // Check it's in intercepted state
+        {
+            let db = state.db.lock().await;
+            let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].status, "intercepted");
+        }
+
+        // Forward original
+        {
+            let mut map = state.intercepted.lock().unwrap();
+            let ids: Vec<String> = map.keys().cloned().collect();
+            assert_eq!(ids.len(), 1);
+            let sender = map.remove(&ids[0]).unwrap();
+            sender.send(crate::types::InterceptAction::ForwardOriginal).unwrap();
+        }
+
+        let resp = client_task.await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["usage"]["input_tokens"], 10);
+    }
+
+    #[tokio::test]
+    async fn intercept_reject_returns_403() {
+        let upstream = spawn_mock_upstream(|| (200, "application/json", MOCK_JSON_BODY)).await;
+        let (proxy_url, state) = spawn_proxy(upstream).await;
+
+        state.intercept_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let proxy_url_clone = proxy_url.clone();
+        let client_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{proxy_url_clone}/v1/messages"))
+                .header("content-type", "application/json")
+                .body(r#"{"model":"claude","messages":[],"max_tokens":1}"#)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        wait_for_intercept(&state).await;
+
+        // Reject
+        {
+            let mut map = state.intercepted.lock().unwrap();
+            let ids: Vec<String> = map.keys().cloned().collect();
+            assert_eq!(ids.len(), 1);
+            let sender = map.remove(&ids[0]).unwrap();
+            sender.send(crate::types::InterceptAction::Reject).unwrap();
+        }
+
+        let resp = client_task.await.unwrap();
+        assert_eq!(resp.status(), 403);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let db = state.db.lock().await;
+        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        assert_eq!(reqs[0].status, "rejected");
+    }
+
+    #[tokio::test]
+    async fn intercept_forward_modified_sends_new_body() {
+        // Use a mock that echoes the request body back
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let io = TokioIo::new(stream);
+                let _ = http1::Builder::new()
+                    .serve_connection(io, service_fn(|req: Request<hyper::body::Incoming>| async {
+                        use http_body_util::BodyExt;
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let body_str = String::from_utf8_lossy(&body).to_string();
+                        // Parse and return the model field
+                        let parsed: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+                        let resp_body = serde_json::json!({
+                            "model": parsed.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"),
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        });
+                        Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(serde_json::to_string(&resp_body).unwrap())))
+                                .unwrap()
+                        )
+                    }))
+                    .await;
+            }
+        });
+
+        let upstream_url = format!("http://{addr}");
+        let (proxy_url, state) = spawn_proxy(upstream_url).await;
+        state.intercept_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let proxy_url_clone = proxy_url.clone();
+        let client_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{proxy_url_clone}/v1/messages"))
+                .header("content-type", "application/json")
+                .body(r#"{"model":"original-model","messages":[],"max_tokens":1}"#)
+                .send()
+                .await
+                .unwrap()
+        });
+
+        wait_for_intercept(&state).await;
+
+        // Forward modified with a new model
+        {
+            let mut map = state.intercepted.lock().unwrap();
+            let ids: Vec<String> = map.keys().cloned().collect();
+            assert_eq!(ids.len(), 1);
+            let sender = map.remove(&ids[0]).unwrap();
+            sender.send(crate::types::InterceptAction::ForwardModified {
+                body: r#"{"model":"modified-model","messages":[],"max_tokens":1}"#.to_string(),
+            }).unwrap();
+        }
+
+        let resp = client_task.await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["model"], "modified-model");
+    }
+
+    #[tokio::test]
+    async fn intercept_disabled_passes_through() {
+        let upstream = spawn_mock_upstream(|| (200, "application/json", MOCK_JSON_BODY)).await;
+        let (proxy_url, state) = spawn_proxy(upstream).await;
+
+        // Intercept is disabled by default
+        assert!(!state.intercept_enabled.load(std::sync::atomic::Ordering::Relaxed));
+
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy_url}/v1/messages"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude","messages":[],"max_tokens":1}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        // No intercept map entries
+        let map = state.intercepted.lock().unwrap();
+        assert!(map.is_empty());
     }
 }
