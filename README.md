@@ -165,25 +165,8 @@ open http://127.0.0.1:7879
 
 ### Layout
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  Claude Code Inspector                              3 sessions · 1 active │
-├────────────────┬─────────────────────────┬───────────────────────────────┤
-│  SESSIONS      │  REQUESTS               │  DETAIL                       │
-│                │                         │                               │
-│  ★ Starred     │  [proj] 10:23 ✓ ☆      │  POST /v1/messages            │
-│  ○ All         │    1.2k↑ 0.3k↓ 4.2s    │  ──────────────────────────── │
-│                │    2.3k→8.7k            │  REQUEST          RESPONSE    │
-│  ● my-app      │                         │  ─────────        ─────────   │
-│    3 requests  │  [my-app] 10:21 ✓ ★    │  Model: ...       200 complete│
-│                │    0.8k↑ 0.1k↓ 2.1s    │  Input: 1.2k tok  Out: 0.3k   │
-│  ○ api-server  │    1.1k→3.2k            │  Cache: 72k read  4.2s        │
-│    5 requests  │                         │                               │
-│                │  [api-s] 10:19 ⏳ ☆    │  user             call·Read   │
-│                │    pending              │  "what file..."   {"file_path"│
-│                │    0.9k→…               │                   :"/foo/bar"}│
-└────────────────┴─────────────────────────┴───────────────────────────────┘
-```
+<img width="1725" height="1024" alt="image" src="https://github.com/user-attachments/assets/2a614bc3-7b97-46e3-bc23-4442b8dfe356" />
+
 
 ### Features
 
