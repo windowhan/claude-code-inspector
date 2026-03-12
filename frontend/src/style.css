@@ -106,7 +106,22 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   margin-bottom: 8px;
   white-space: pre-wrap;
   word-break: break-word;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
 }
+.memo-delete-btn {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.memo-delete-btn:hover { color: var(--red, #f85149); }
 .memo-form {
   display: flex;
   gap: 8px;

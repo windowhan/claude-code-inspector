@@ -422,7 +422,7 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
 
     <div class="memo-section">
       <div class="memo-header">Memo</div>
-      ${req.memo ? `<div class="memo-display" id="memoDisplay">${esc(req.memo)}</div>` : ''}
+      ${req.memo ? `<div class="memo-display" id="memoDisplay">${esc(req.memo)}<button class="memo-delete-btn" id="memoDeleteBtn" title="Delete memo">&times;</button></div>` : ''}
       <div class="memo-form">
         <input type="text" id="memoInput" class="memo-input" placeholder="Write a memo…" value="${esc(req.memo || '')}" />
         <button class="btn btn-sm" id="memoSaveBtn">Save</button>
@@ -484,6 +484,19 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
   memoInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); saveMemo() }
   })
+
+  // Memo delete
+  const memoDeleteBtn = document.getElementById('memoDeleteBtn')
+  if (memoDeleteBtn) {
+    memoDeleteBtn.addEventListener('click', async () => {
+      await setMemo(req.id, '')
+      const r = requests.find(r => r.id === req.id)
+      if (r) r.memo = ''
+      renderRequests()
+      const d = document.getElementById('memoDisplay')
+      if (d) d.remove()
+    })
+  }
 
   // Intercept action buttons
   if (req.status === 'intercepted') {
