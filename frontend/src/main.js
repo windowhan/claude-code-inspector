@@ -127,7 +127,9 @@ function renderSessions() {
     </div>`
   }
 
+  const sessionScroll = $sessionList.scrollTop
   $sessionList.innerHTML = html
+  $sessionList.scrollTop = sessionScroll
 
   // Session select
   $sessionList.querySelectorAll('[data-sid]').forEach(el => {
@@ -182,7 +184,9 @@ function renderRequests() {
       </div>
     </div>`
   }
+  const reqScroll = $reqList.scrollTop
   $reqList.innerHTML = html
+  $reqList.scrollTop = reqScroll
   $reqList.querySelectorAll('[data-rid]').forEach(el => {
     el.addEventListener('click', (e) => {
       if (e.target.closest('[data-star-rid]')) return
@@ -487,18 +491,20 @@ async function init() {
   connectEvents((e) => {
     loadSessions()
     loadRequests()
+
+    let eventRequestId = null
+    try { eventRequestId = JSON.parse(e.data)?.data?.id } catch (_) {}
+
     // Auto-select intercepted requests
-    if (e.type === 'request_intercepted') {
-      try {
-        const d = JSON.parse(e.data)
-        if (d.data?.id) {
-          selectedRequest = d.data.id
-          loadDetail(selectedRequest)
-          return
-        }
-      } catch (_) {}
+    if (e.type === 'request_intercepted' && eventRequestId) {
+      selectedRequest = eventRequestId
+      loadDetail(selectedRequest)
+      return
     }
-    if (selectedRequest) loadDetail(selectedRequest)
+    // Only reload detail if the event is about the selected request
+    if (selectedRequest && eventRequestId === selectedRequest) {
+      loadDetail(selectedRequest)
+    }
   })
 }
 
