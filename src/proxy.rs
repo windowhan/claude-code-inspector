@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::db;
 use crate::intercept;
+use crate::routing;
 use crate::session::{resolve_session, SessionCache};
 use crate::sse_tee::{parse_sse_content, SseTeeStream};
 use crate::types::{AppState, DashboardEvent, InterceptAction, RequestRecord, SessionRecord};
@@ -115,6 +116,13 @@ async fn handle_inner(
     ];
 
     let headers = req.headers().clone();
+
+    // Extract incoming API key for use as classifier fallback
+    let incoming_api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let mut log_headers: HashMap<String, String> = HashMap::new();
     let mut upstream_headers: HashMap<String, String> = HashMap::new();
 
@@ -171,6 +179,8 @@ async fn handle_inner(
         memo: String::new(),
         agent_type: agent_type.clone(),
         agent_task: agent_task.clone(),
+        routing_category: String::new(),
+        routed_to_url: String::new(),
     };
 
     {
@@ -273,18 +283,56 @@ async fn handle_inner(
         }
     }
 
+    // ── Routing decision ─────────────────────────────────────────────────────
+    let (resolved_base_url, final_body_bytes, routing_category, routed_to_url) = {
+        let config = state.routing_config.read().await;
+        if config.enabled {
+            let body_val = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                .unwrap_or_default();
+            let category = routing::classify_intent(&config, &incoming_api_key, &body_val).await;
+            let rules = state.routing_rules.read().await;
+            match routing::match_rule(&rules, &category) {
+                Some(rule) => {
+                    let out_body = if rule.model_override.is_empty() {
+                        body_bytes.clone()
+                    } else {
+                        Bytes::from(routing::apply_model_override(&body_bytes, &rule.model_override))
+                    };
+                    let routed = if rule.target_url != state.upstream_url {
+                        rule.target_url.clone()
+                    } else {
+                        String::new()
+                    };
+                    (rule.target_url.clone(), out_body, category, routed)
+                }
+                None => (state.upstream_url.clone(), body_bytes.clone(), category, String::new()),
+            }
+        } else {
+            (state.upstream_url.clone(), body_bytes.clone(), String::new(), String::new())
+        }
+    };
+
+    // Update routing fields in DB if routing produced a category
+    if !routing_category.is_empty() || !routed_to_url.is_empty() {
+        let db = state.db.lock().await;
+        let _ = db.execute(
+            "UPDATE requests SET routing_category = ?1, routed_to_url = ?2 WHERE id = ?3",
+            rusqlite::params![routing_category, routed_to_url, request_id],
+        );
+    }
+
     // Forward to upstream (URL from AppState — configurable for testing)
-    let upstream_url = format!("{}{path}", state.upstream_url);
+    let upstream_url = format!("{resolved_base_url}{path}");
     let client = reqwest::Client::builder()
         .use_rustls_tls()
-        .danger_accept_invalid_certs(state.upstream_url.starts_with("http://"))
+        .danger_accept_invalid_certs(resolved_base_url.starts_with("http://"))
         .build()?;
 
     let mut req_builder = client.request(method.clone(), &upstream_url);
     for (k, v) in &upstream_headers {
         req_builder = req_builder.header(k, v);
     }
-    req_builder = req_builder.body(body_bytes.to_vec());
+    req_builder = req_builder.body(final_body_bytes.to_vec());
 
     let upstream_resp = req_builder.send().await?;
     let status = upstream_resp.status();
@@ -1020,5 +1068,105 @@ mod tests {
         let body = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>ignore</system-reminder>"},{"type":"text","text":"actual task here"}]}]}"#;
         let (_, task) = detect_agent_type(body);
         assert_eq!(task, "actual task here");
+    }
+
+    #[tokio::test]
+    async fn routing_disabled_passes_to_default_upstream() {
+        // With routing disabled (default), requests go to the configured upstream
+        let upstream = spawn_mock_upstream(|| (200, "application/json", MOCK_JSON_BODY)).await;
+        let (proxy_url, state) = spawn_proxy(upstream.clone()).await;
+
+        // Routing is disabled by default
+        {
+            let config = state.routing_config.read().await;
+            assert!(!config.enabled);
+        }
+
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy_url}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "test-key")
+            .body(r#"{"model":"claude","messages":[{"role":"user","content":"hi"}],"max_tokens":10}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["usage"]["input_tokens"], 10);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let db = state.db.lock().await;
+        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        assert_eq!(reqs.len(), 1);
+        // routing_category should be empty when routing is disabled
+        assert_eq!(reqs[0].routing_category, "");
+    }
+
+    #[tokio::test]
+    async fn routing_with_enabled_config_updates_db_fields() {
+        // Setup a mock classifier that returns "code_gen"
+        let classifier_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let classifier_addr = classifier_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept multiple connections for classifier calls
+            for _ in 0..5 {
+                let Ok((stream, _)) = classifier_listener.accept().await else { break };
+                let io = TokioIo::new(stream);
+                let _ = http1::Builder::new()
+                    .serve_connection(io, service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                        Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(r#"{"content":[{"type":"text","text":"code_gen"}]}"#)))
+                                .unwrap()
+                        )
+                    }))
+                    .await;
+            }
+        });
+
+        let upstream = spawn_mock_upstream(|| (200, "application/json", MOCK_JSON_BODY)).await;
+        let (proxy_url, state) = spawn_proxy(upstream.clone()).await;
+
+        // Enable routing with classifier URL pointing to mock
+        {
+            let mut config = state.routing_config.write().await;
+            config.enabled = true;
+            config.classifier_base_url = format!("http://{classifier_addr}");
+            config.classifier_api_key = "test-key".to_string();
+        }
+
+        // Add a routing rule for code_gen that routes to the same upstream (no redirect)
+        {
+            let mut rules = state.routing_rules.write().await;
+            rules.push(crate::types::RoutingRule {
+                id: "r1".to_string(),
+                priority: 10,
+                enabled: true,
+                category: "code_gen".to_string(),
+                target_url: upstream.clone(),
+                model_override: String::new(),
+                label: "test".to_string(),
+            });
+        }
+
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy_url}/v1/messages"))
+            .header("content-type", "application/json")
+            .header("x-api-key", "test-key")
+            .body(r#"{"model":"claude","messages":[{"role":"user","content":"write some code"}],"max_tokens":10}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let db = state.db.lock().await;
+        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].routing_category, "code_gen");
     }
 }

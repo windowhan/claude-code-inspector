@@ -1,4 +1,4 @@
-import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest } from './api.js'
+import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest, getRoutingConfig, saveRoutingConfig, getRoutingRules, createRoutingRule, updateRoutingRule, deleteRoutingRule, reorderRoutingRules, testRoutingClassifier } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -9,6 +9,10 @@ let selectedRequest = null        // id string
 let interceptEnabled = false
 let searchQuery = ''
 let searchDebounceTimer = null
+let routingPanelOpen = false
+let routingConfig = null
+let routingRules = []
+let editingRuleId = null          // null = not editing, 'new' = adding new
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 document.querySelector('#app').innerHTML = `
@@ -18,6 +22,9 @@ document.querySelector('#app').innerHTML = `
   <button class="intercept-toggle" id="interceptToggle" title="Toggle request interception">
     <span class="intercept-dot" id="interceptDot"></span>
     <span id="interceptLabel">Intercept</span>
+  </button>
+  <button class="routing-btn" id="routingBtn" title="Configure multi-provider routing">
+    <span id="routingLabel">⇄ Routes</span>
   </button>
   <span class="header-meta" id="hMeta">Loading…</span>
 </header>
@@ -44,6 +51,8 @@ document.querySelector('#app').innerHTML = `
 const $interceptToggle = document.getElementById('interceptToggle')
 const $interceptDot    = document.getElementById('interceptDot')
 const $interceptLabel  = document.getElementById('interceptLabel')
+const $routingBtn      = document.getElementById('routingBtn')
+const $routingLabel    = document.getElementById('routingLabel')
 const $hMeta       = document.getElementById('hMeta')
 const $sessionList = document.getElementById('sessionList')
 const $reqCount    = document.getElementById('reqCount')
@@ -95,6 +104,284 @@ $interceptToggle.addEventListener('click', async () => {
   interceptEnabled = res.enabled
   renderInterceptToggle()
 })
+
+// ── Routing UI ────────────────────────────────────────────────────────────────
+function renderRoutingBtn() {
+  const enabledRuleCount = routingRules.filter(r => r.enabled).length
+  const label = `⇄ Routes${enabledRuleCount > 0 ? ' · ' + enabledRuleCount : ''}`
+  $routingLabel.textContent = label
+  const isActive = routingConfig && routingConfig.enabled && routingRules.length > 0
+  $routingBtn.classList.toggle('active', isActive)
+}
+
+$routingBtn.addEventListener('click', () => {
+  routingPanelOpen = !routingPanelOpen
+  if (routingPanelOpen) {
+    renderRoutingPanel()
+  } else {
+    if (selectedRequest) {
+      loadDetail(selectedRequest)
+    } else {
+      $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
+    }
+  }
+})
+
+function renderRoutingPanel() {
+  if (!routingPanelOpen) return
+  const cfg = routingConfig || {}
+  const rules = routingRules
+
+  const formatOptions = ['anthropic', 'open_ai'].map(f =>
+    `<option value="${f}" ${(cfg.classifier_api_format || 'anthropic') === f ? 'selected' : ''}>${f === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>`
+  ).join('')
+
+  const rulesHtml = rules.map((rule, idx) => `
+    <div class="rule-row ${rule.enabled ? '' : 'disabled'}" data-rule-id="${esc(rule.id)}">
+      <button class="btn btn-sm" data-rule-up="${idx}" title="Move up" ${idx === 0 ? 'disabled' : ''}>↑</button>
+      <button class="btn btn-sm" data-rule-down="${idx}" title="Move down" ${idx === rules.length - 1 ? 'disabled' : ''}>↓</button>
+      <input type="checkbox" class="rule-enabled-cb" data-rule-id="${esc(rule.id)}" ${rule.enabled ? 'checked' : ''} title="Enable/Disable">
+      <span class="routing-badge">${esc(rule.category)}</span>
+      <span style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(rule.target_url)}">${esc(rule.target_url)}</span>
+      ${rule.model_override ? `<span style="font-size:11px;color:var(--text-muted)">${esc(rule.model_override)}</span>` : ''}
+      ${rule.label ? `<span style="font-size:11px;color:var(--yellow)">${esc(rule.label)}</span>` : ''}
+      <button class="btn btn-sm" data-rule-edit="${esc(rule.id)}">Edit</button>
+      <button class="btn btn-sm btn-danger" data-rule-del="${esc(rule.id)}">✕</button>
+    </div>
+  `).join('')
+
+  $detail.innerHTML = `
+    <div class="routing-panel">
+      <div class="routing-section">
+        <h3>Classifier Settings</h3>
+        <div class="meta-row">
+          <span class="meta-label">Enabled</span>
+          <input type="checkbox" id="rEnabled" ${cfg.enabled ? 'checked' : ''}>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Provider URL</span>
+          <input type="text" class="memo-input" id="rBaseUrl" value="${esc(cfg.classifier_base_url || 'https://api.anthropic.com')}" style="flex:1">
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">API Format</span>
+          <select id="rFormat" class="memo-input" style="flex:1">${formatOptions}</select>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Model</span>
+          <input type="text" class="memo-input" id="rModel" value="${esc(cfg.classifier_model || 'claude-haiku-4-5-20251001')}" style="flex:1">
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">API Key</span>
+          <input type="password" class="memo-input" id="rApiKey" value="${esc(cfg.classifier_api_key || '')}" placeholder="Leave empty to use proxy key" style="flex:1">
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Categories</span>
+          <input type="text" class="memo-input" id="rCategories" value="${esc((cfg.categories || []).join(', '))}" placeholder="code_gen, docs, qa, other" style="flex:1">
+        </div>
+        <div class="meta-row" style="align-items:flex-start">
+          <span class="meta-label">System Prompt</span>
+          <textarea class="intercept-textarea" id="rPrompt" rows="3" style="flex:1;min-height:60px">${esc(cfg.classifier_prompt || '')}</textarea>
+        </div>
+      </div>
+
+      <div class="routing-section">
+        <h3>Routing Rules <button class="btn btn-sm" id="addRuleBtn" style="margin-left:8px">+ Add Rule</button></h3>
+        <div id="rulesList">${rulesHtml || '<div class="empty-msg" style="padding:8px 0;font-size:12px">No rules yet</div>'}</div>
+        <div id="ruleForm" style="display:none;margin-top:8px;padding:8px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
+          <div class="meta-row">
+            <span class="meta-label">Category</span>
+            <input type="text" class="memo-input" id="rfCategory" placeholder="code_gen" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Target URL</span>
+            <input type="text" class="memo-input" id="rfTargetUrl" placeholder="https://api.openai.com" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Model Override</span>
+            <input type="text" class="memo-input" id="rfModelOverride" placeholder="gpt-4 (optional)" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Label</span>
+            <input type="text" class="memo-input" id="rfLabel" placeholder="description (optional)" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Enabled</span>
+            <input type="checkbox" id="rfEnabled" checked>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button class="btn btn-primary" id="rfSaveBtn">Save Rule</button>
+            <button class="btn" id="rfCancelBtn">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="routing-section">
+        <h3>Test Classifier</h3>
+        <div class="meta-row" style="align-items:flex-start">
+          <span class="meta-label">Prompt</span>
+          <textarea class="intercept-textarea" id="rTestPrompt" rows="2" style="flex:1;min-height:50px" placeholder="Enter a test prompt…"></textarea>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+          <button class="btn btn-primary" id="rTestBtn">Test</button>
+          <span id="rTestResult" style="font-size:13px;color:var(--text-muted)"></span>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;display:flex;gap:8px">
+        <button class="btn btn-primary" id="rSaveAllBtn">Save All Settings</button>
+        <button class="btn" id="rCloseBtn">Close</button>
+      </div>
+    </div>
+  `
+
+  // Save all settings
+  document.getElementById('rSaveAllBtn').addEventListener('click', async () => {
+    const newCfg = {
+      enabled: document.getElementById('rEnabled').checked,
+      classifier_base_url: document.getElementById('rBaseUrl').value.trim(),
+      classifier_api_key: document.getElementById('rApiKey').value.trim(),
+      classifier_model: document.getElementById('rModel').value.trim(),
+      classifier_api_format: document.getElementById('rFormat').value,
+      categories: document.getElementById('rCategories').value.split(',').map(s => s.trim()).filter(Boolean),
+      classifier_prompt: document.getElementById('rPrompt').value,
+    }
+    routingConfig = await saveRoutingConfig(newCfg)
+    renderRoutingBtn()
+    renderRoutingPanel()
+  })
+
+  // Close
+  document.getElementById('rCloseBtn').addEventListener('click', () => {
+    routingPanelOpen = false
+    if (selectedRequest) {
+      loadDetail(selectedRequest)
+    } else {
+      $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
+    }
+  })
+
+  // Add rule button
+  document.getElementById('addRuleBtn').addEventListener('click', () => {
+    editingRuleId = 'new'
+    document.getElementById('ruleForm').style.display = ''
+    document.getElementById('rfCategory').value = ''
+    document.getElementById('rfTargetUrl').value = ''
+    document.getElementById('rfModelOverride').value = ''
+    document.getElementById('rfLabel').value = ''
+    document.getElementById('rfEnabled').checked = true
+  })
+
+  // Rule up/down buttons
+  document.querySelectorAll('[data-rule-up]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const idx = parseInt(btn.dataset.ruleUp)
+      if (idx <= 0) return
+      const ids = routingRules.map(r => r.id)
+      ;[ids[idx - 1], ids[idx]] = [ids[idx], ids[idx - 1]]
+      routingRules = await reorderRoutingRules(ids)
+      renderRoutingPanel()
+    })
+  })
+
+  document.querySelectorAll('[data-rule-down]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const idx = parseInt(btn.dataset.ruleDown)
+      if (idx >= routingRules.length - 1) return
+      const ids = routingRules.map(r => r.id)
+      ;[ids[idx], ids[idx + 1]] = [ids[idx + 1], ids[idx]]
+      routingRules = await reorderRoutingRules(ids)
+      renderRoutingPanel()
+    })
+  })
+
+  // Rule enable/disable checkboxes
+  document.querySelectorAll('.rule-enabled-cb').forEach(cb => {
+    cb.addEventListener('change', async () => {
+      const ruleId = cb.dataset.ruleId
+      const rule = routingRules.find(r => r.id === ruleId)
+      if (!rule) return
+      const updated = { ...rule, enabled: cb.checked }
+      await updateRoutingRule(ruleId, updated)
+      routingRules = await getRoutingRules()
+      renderRoutingBtn()
+      renderRoutingPanel()
+    })
+  })
+
+  // Rule edit buttons
+  document.querySelectorAll('[data-rule-edit]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const ruleId = btn.dataset.ruleEdit
+      const rule = routingRules.find(r => r.id === ruleId)
+      if (!rule) return
+      editingRuleId = ruleId
+      document.getElementById('ruleForm').style.display = ''
+      document.getElementById('rfCategory').value = rule.category
+      document.getElementById('rfTargetUrl').value = rule.target_url
+      document.getElementById('rfModelOverride').value = rule.model_override || ''
+      document.getElementById('rfLabel').value = rule.label || ''
+      document.getElementById('rfEnabled').checked = rule.enabled
+    })
+  })
+
+  // Rule delete buttons
+  document.querySelectorAll('[data-rule-del]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const ruleId = btn.dataset.ruleDel
+      if (!confirm('Delete this routing rule?')) return
+      await deleteRoutingRule(ruleId)
+      routingRules = await getRoutingRules()
+      renderRoutingBtn()
+      renderRoutingPanel()
+    })
+  })
+
+  // Rule form save
+  document.getElementById('rfSaveBtn').addEventListener('click', async () => {
+    const category = document.getElementById('rfCategory').value.trim()
+    const targetUrl = document.getElementById('rfTargetUrl').value.trim()
+    if (!category || !targetUrl) { alert('Category and Target URL are required'); return }
+    const ruleData = {
+      id: editingRuleId || '',
+      priority: 0,
+      enabled: document.getElementById('rfEnabled').checked,
+      category,
+      target_url: targetUrl,
+      model_override: document.getElementById('rfModelOverride').value.trim(),
+      label: document.getElementById('rfLabel').value.trim(),
+    }
+    if (editingRuleId === 'new') {
+      await createRoutingRule(ruleData)
+    } else if (editingRuleId) {
+      await updateRoutingRule(editingRuleId, { ...ruleData, id: editingRuleId })
+    }
+    editingRuleId = null
+    routingRules = await getRoutingRules()
+    renderRoutingBtn()
+    renderRoutingPanel()
+  })
+
+  // Rule form cancel
+  document.getElementById('rfCancelBtn').addEventListener('click', () => {
+    editingRuleId = null
+    document.getElementById('ruleForm').style.display = 'none'
+  })
+
+  // Test classifier
+  document.getElementById('rTestBtn').addEventListener('click', async () => {
+    const prompt = document.getElementById('rTestPrompt').value.trim()
+    const result = document.getElementById('rTestResult')
+    result.textContent = 'Testing…'
+    const res = await testRoutingClassifier(prompt)
+    if (res.error) {
+      result.textContent = `Error: ${res.error}`
+      result.style.color = 'var(--red)'
+    } else {
+      result.textContent = `Category: ${res.category}`
+      result.style.color = 'var(--green)'
+    }
+  })
+}
 
 // ── Render ────────────────────────────────────────────────────────────────────
 function renderSessions() {
@@ -184,6 +471,7 @@ function renderRequests() {
         ${dur ? `<span title="Response time">${dur}</span>` : ''}
         ${r.is_streaming ? '<span class="req-tag streaming" title="Server-Sent Events streaming response">stream</span>' : '<span class="req-tag" title="Single JSON response">json</span>'}
         ${r.memo ? `<span class="req-memo" title="${esc(r.memo)}">${esc(r.memo)}</span>` : ''}
+        ${r.routing_category ? `<span class="routing-badge" title="Routed: ${esc(r.routing_category)}">${esc(r.routing_category)}</span>` : ''}
       </div>
     </div>`
   }
@@ -402,6 +690,7 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
       <span class="detail-time">${fmtTime(req.timestamp)}</span>
       <button class="btn btn-sm" id="copyCurl">Copy curl</button>
     </div>
+    ${req.routing_category ? `<div class="routing-meta">Routing: <span class="routing-badge">${esc(req.routing_category)}</span> → ${esc(req.routed_to_url || 'default upstream')}</div>` : ''}
 
     <div class="split-pane">
       <div class="split-col">
@@ -615,6 +904,13 @@ async function init() {
     const res = await getInterceptStatus()
     interceptEnabled = res.enabled
     renderInterceptToggle()
+  } catch (_) {}
+
+  // Load routing config and rules
+  try {
+    routingConfig = await getRoutingConfig()
+    routingRules = await getRoutingRules()
+    renderRoutingBtn()
   } catch (_) {}
 
   await loadSessions()

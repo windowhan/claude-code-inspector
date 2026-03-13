@@ -335,6 +335,8 @@ mod tests {
             memo: String::new(),
             agent_type: "main".to_string(),
             agent_task: String::new(),
+            routing_category: String::new(),
+            routed_to_url: String::new(),
         }).unwrap();
         // Populate response fields (insert_request only stores base fields)
         db::update_request_complete(

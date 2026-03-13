@@ -7,10 +7,12 @@ use http_body_util::{Full, BodyExt, StreamBody};
 use hyper::body::Frame;
 use hyper::{Request, Response, StatusCode};
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::db;
 use crate::intercept;
-use crate::types::{AppState, InterceptAction};
+use crate::routing;
+use crate::types::{AppState, InterceptAction, RoutingConfig, RoutingRule};
 
 // A boxed body type that can be either Full<Bytes> or a streaming body
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -33,8 +35,8 @@ pub async fn handle_dashboard(
     let path  = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
-    // Read body for POST requests that need it
-    let post_body = if method == "POST" {
+    // Read body for methods that may have a request body
+    let request_body = if method == "POST" || method == "PUT" || method == "PATCH" {
         let body = req.into_body().collect().await.ok()
             .map(|b| b.to_bytes().to_vec())
             .unwrap_or_default();
@@ -57,7 +59,7 @@ pub async fn handle_dashboard(
         }
         ("POST", p) if p.starts_with("/api/requests/") && p.ends_with("/memo") => {
             let id = p.trim_start_matches("/api/requests/").trim_end_matches("/memo");
-            let body = post_body.as_deref().unwrap_or(&[]);
+            let body = request_body.as_deref().unwrap_or(&[]);
             full_to_box(serve_set_memo(&state, id, body).await)
         }
         ("GET", p) if p.starts_with("/api/requests/") => {
@@ -73,13 +75,28 @@ pub async fn handle_dashboard(
         }
         ("POST", p) if p.starts_with("/api/intercept/") && p.ends_with("/forward-modified") => {
             let id = p.trim_start_matches("/api/intercept/").trim_end_matches("/forward-modified");
-            let body = post_body.as_deref().unwrap_or(&[]);
+            let body = request_body.as_deref().unwrap_or(&[]);
             full_to_box(serve_intercept_forward_modified(&state, id, body))
         }
         ("POST", p) if p.starts_with("/api/intercept/") && p.ends_with("/reject") => {
             let id = p.trim_start_matches("/api/intercept/").trim_end_matches("/reject");
             full_to_box(serve_intercept_reject(&state, id))
         }
+        // Routing API
+        ("GET", "/api/routing/config") => full_to_box(serve_routing_config_get(&state).await),
+        ("POST", "/api/routing/config") => full_to_box(serve_routing_config_save(&state, request_body.as_deref().unwrap_or(&[])).await),
+        ("GET", "/api/routing/rules") => full_to_box(serve_routing_rules_list(&state).await),
+        ("POST", "/api/routing/rules") => full_to_box(serve_routing_rules_create(&state, request_body.as_deref().unwrap_or(&[])).await),
+        ("PUT", p) if p.starts_with("/api/routing/rules/") => {
+            let id = p.trim_start_matches("/api/routing/rules/");
+            full_to_box(serve_routing_rules_update(&state, id, request_body.as_deref().unwrap_or(&[])).await)
+        }
+        ("DELETE", p) if p.starts_with("/api/routing/rules/") => {
+            let id = p.trim_start_matches("/api/routing/rules/");
+            full_to_box(serve_routing_rules_delete(&state, id).await)
+        }
+        ("POST", "/api/routing/reorder") => full_to_box(serve_routing_reorder(&state, request_body.as_deref().unwrap_or(&[])).await),
+        ("POST", "/api/routing/test") => full_to_box(serve_routing_test(&state, request_body.as_deref().unwrap_or(&[])).await),
         ("GET", "/events") => serve_sse_stream(&state),
         ("GET", _) => full_to_box(serve_static(&path)),
         _ => full_to_box(Response::builder().status(StatusCode::METHOD_NOT_ALLOWED)
@@ -139,6 +156,15 @@ fn json_response(data: serde_json::Value) -> Response<Full<Bytes>> {
         .header("content-type", "application/json")
         .header("access-control-allow-origin", "*")
         .body(Full::new(Bytes::from(serde_json::to_string(&data).unwrap_or_default())))
+        .unwrap()
+}
+
+fn json_error(msg: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .header("access-control-allow-origin", "*")
+        .body(Full::new(Bytes::from(serde_json::json!({"error": msg}).to_string())))
         .unwrap()
 }
 
@@ -309,6 +335,147 @@ fn serve_intercept_reject(state: &AppState, id: &str) -> Response<Full<Bytes>> {
     }
 }
 
+// ── Routing handlers ──────────────────────────────────────────────────────────
+
+async fn serve_routing_config_get(state: &AppState) -> Response<Full<Bytes>> {
+    let config = state.routing_config.read().await;
+    json_response(serde_json::to_value(&*config).unwrap_or_default())
+}
+
+async fn serve_routing_config_save(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let config: RoutingConfig = match serde_json::from_slice(body) {
+        Ok(c) => c,
+        Err(e) => return json_error(&e.to_string()),
+    };
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::save_routing_config(&db, &config) {
+            return json_error(&e.to_string());
+        }
+    }
+    *state.routing_config.write().await = config.clone();
+    json_response(serde_json::to_value(&config).unwrap_or_default())
+}
+
+async fn serve_routing_rules_list(state: &AppState) -> Response<Full<Bytes>> {
+    let rules = state.routing_rules.read().await;
+    json_response(serde_json::to_value(&*rules).unwrap_or_default())
+}
+
+async fn serve_routing_rules_create(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let mut rule: RoutingRule = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return json_error(&e.to_string()),
+    };
+    // Generate a new UUID for the id
+    rule.id = Uuid::new_v4().to_string();
+    // Set priority based on existing rules count
+    let priority = {
+        let rules = state.routing_rules.read().await;
+        (rules.len() + 1) as i64 * 10
+    };
+    rule.priority = priority;
+
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::insert_routing_rule(&db, &rule) {
+            return json_error(&e.to_string());
+        }
+    }
+    let rule_val = serde_json::to_value(&rule).unwrap_or_default();
+    state.routing_rules.write().await.push(rule);
+    json_response(rule_val)
+}
+
+async fn serve_routing_rules_update(state: &AppState, id: &str, body: &[u8]) -> Response<Full<Bytes>> {
+    let mut rule: RoutingRule = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return json_error(&e.to_string()),
+    };
+    rule.id = id.to_string();
+
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::update_routing_rule(&db, &rule) {
+            return json_error(&e.to_string());
+        }
+    }
+    {
+        let mut rules = state.routing_rules.write().await;
+        if let Some(existing) = rules.iter_mut().find(|r| r.id == id) {
+            *existing = rule.clone();
+        }
+    }
+    json_response(serde_json::to_value(&rule).unwrap_or_default())
+}
+
+async fn serve_routing_rules_delete(state: &AppState, id: &str) -> Response<Full<Bytes>> {
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::delete_routing_rule(&db, id) {
+            return json_error(&e.to_string());
+        }
+    }
+    state.routing_rules.write().await.retain(|r| r.id != id);
+    json_response(serde_json::json!({"ok": true}))
+}
+
+async fn serve_routing_reorder(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(&e.to_string()),
+    };
+    let ids: Vec<String> = match parsed.get("ids").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+        None => return json_error("ids field required"),
+    };
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::reorder_routing_rules(&db, &ids) {
+            return json_error(&e.to_string());
+        }
+        // Reload rules from DB
+        match db::get_routing_rules(&db) {
+            Ok(rules) => {
+                *state.routing_rules.write().await = rules;
+            }
+            Err(e) => return json_error(&e.to_string()),
+        }
+    }
+    let rules = state.routing_rules.read().await;
+    json_response(serde_json::to_value(&*rules).unwrap_or_default())
+}
+
+async fn serve_routing_test(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => return json_error(&e.to_string()),
+    };
+    let prompt = parsed.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let system = parsed.get("system").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let config = state.routing_config.read().await.clone();
+    if !config.enabled && config.classifier_api_key.is_empty() {
+        return json_error("routing not enabled or no classifier key configured");
+    }
+
+    // Build messages from prompt
+    let mut messages = Vec::new();
+    if !system.is_empty() {
+        messages.push(serde_json::json!({"role": "user", "content": system}));
+    }
+    if !prompt.is_empty() {
+        messages.push(serde_json::json!({"role": "user", "content": prompt}));
+    }
+    if messages.is_empty() {
+        messages.push(serde_json::json!({"role": "user", "content": "test"}));
+    }
+    let request_body = serde_json::json!({"messages": messages});
+
+    let category = routing::classify_intent(&config, "", &request_body).await;
+    json_response(serde_json::json!({"category": category}))
+}
+
 fn url_decode(s: &str) -> String {
     let s = s.replace('+', " ");
     let mut result = String::with_capacity(s.len());
@@ -344,8 +511,14 @@ fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::db;
-    use crate::types::{DashboardEvent, RequestRecord, SessionRecord};
+    use crate::types::{DashboardEvent, RequestRecord, RoutingConfig, RoutingRule, SessionRecord, ClassifierApiFormat};
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::service::service_fn;
+    use hyper::server::conn::http1;
+    use hyper_util::rt::TokioIo;
     use rusqlite::Connection;
+    use tokio::net::TcpListener;
     use tokio::sync::broadcast;
 
     fn make_state() -> Arc<AppState> {
@@ -391,18 +564,11 @@ mod tests {
             memo: String::new(),
             agent_type: "main".to_string(),
             agent_task: String::new(),
+            routing_category: String::new(),
+            routed_to_url: String::new(),
         }).unwrap();
         // Populate the response fields (insert_request only stores base fields)
         db::update_request_complete(&db, req_id, 200, "{}", "{}", Some(5), Some(3), 100, "complete").unwrap();
-    }
-
-    // Helper: build a fake hyper request (body unused for API routes)
-    fn fake_request(path: &str) -> Request<hyper::body::Incoming> {
-        // We can't construct Incoming without a live connection, so we test
-        // the inner async functions directly (serve_sessions, etc.) instead.
-        // This function exists only as documentation of the approach.
-        let _ = path;
-        unreachable!("use serve_* helpers directly")
     }
 
     #[tokio::test]
@@ -593,6 +759,14 @@ mod tests {
         assert_eq!(resp.status(), 200);
     }
 
+    #[test]
+    fn json_error_returns_400() {
+        let resp = json_error("something went wrong");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("application/json"));
+    }
+
     #[tokio::test]
     async fn serve_delete_session_removes_data() {
         let state = make_state();
@@ -677,8 +851,10 @@ mod tests {
                 status: "pending".to_string(),
                 starred: false,
                 memo: String::new(),
-            agent_type: "main".to_string(),
-            agent_task: String::new(),
+                agent_type: "main".to_string(),
+                agent_task: String::new(),
+                routing_category: String::new(),
+                routed_to_url: String::new(),
             }).unwrap();
         }
         seed_request(&state, "r-other", &sid);
@@ -814,6 +990,201 @@ mod tests {
         let bytes = resp_body_to_bytes(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["memo"], "");
+    }
+
+    // ── Routing API tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn serve_routing_config_get_and_save() {
+        let state = make_state();
+
+        // GET default config
+        let bytes = resp_body_to_bytes(serve_routing_config_get(&state).await).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["enabled"], false);
+        assert_eq!(obj["classifier_model"], "claude-haiku-4-5-20251001");
+
+        // POST to save
+        let new_config = RoutingConfig {
+            enabled: true,
+            classifier_base_url: "https://openai.com".to_string(),
+            classifier_api_key: "sk-test".to_string(),
+            classifier_model: "gpt-4".to_string(),
+            classifier_api_format: ClassifierApiFormat::OpenAi,
+            categories: vec!["code".to_string(), "other".to_string()],
+            classifier_prompt: "custom prompt".to_string(),
+        };
+        let body = serde_json::to_vec(&new_config).unwrap();
+        let resp = serve_routing_config_save(&state, &body).await;
+        assert_eq!(resp.status(), 200);
+
+        let bytes = resp_body_to_bytes(resp).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["enabled"], true);
+        assert_eq!(obj["classifier_model"], "gpt-4");
+
+        // State should be updated
+        let config = state.routing_config.read().await;
+        assert!(config.enabled);
+        assert_eq!(config.classifier_model, "gpt-4");
+    }
+
+    #[tokio::test]
+    async fn serve_routing_config_save_invalid_json() {
+        let state = make_state();
+        let resp = serve_routing_config_save(&state, b"not json").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn serve_routing_rules_full_crud() {
+        let state = make_state();
+
+        // List empty
+        let bytes = resp_body_to_bytes(serve_routing_rules_list(&state).await).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(arr.is_empty());
+
+        // Create
+        let rule_body = serde_json::json!({
+            "id": "ignored",  // will be replaced by UUID
+            "priority": 999,  // will be overridden
+            "enabled": true,
+            "category": "code_gen",
+            "target_url": "https://openai.com",
+            "model_override": "gpt-4",
+            "label": "test rule",
+        });
+        let body = serde_json::to_vec(&rule_body).unwrap();
+        let resp = serve_routing_rules_create(&state, &body).await;
+        assert_eq!(resp.status(), 200);
+        let bytes = resp_body_to_bytes(resp).await;
+        let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let rule_id = created["id"].as_str().unwrap().to_string();
+        assert!(!rule_id.is_empty());
+        assert_eq!(created["category"], "code_gen");
+        // Priority auto-assigned
+        assert_eq!(created["priority"], 10);  // 1st rule => (1+1)*10... wait: (0+1)*10=10
+
+        // List should have 1
+        let bytes = resp_body_to_bytes(serve_routing_rules_list(&state).await).await;
+        let arr: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(arr.len(), 1);
+
+        // Update
+        let updated_rule = RoutingRule {
+            id: rule_id.clone(),
+            priority: 5,
+            enabled: false,
+            category: "docs".to_string(),
+            target_url: "https://updated.com".to_string(),
+            model_override: String::new(),
+            label: "updated".to_string(),
+        };
+        let body = serde_json::to_vec(&updated_rule).unwrap();
+        let resp = serve_routing_rules_update(&state, &rule_id, &body).await;
+        assert_eq!(resp.status(), 200);
+        let bytes = resp_body_to_bytes(resp).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["category"], "docs");
+        assert_eq!(obj["enabled"], false);
+
+        // Delete
+        let resp = serve_routing_rules_delete(&state, &rule_id).await;
+        assert_eq!(resp.status(), 200);
+        let bytes = resp_body_to_bytes(resp).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["ok"], true);
+
+        // List should be empty again
+        let rules = state.routing_rules.read().await;
+        assert!(rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serve_routing_reorder_test() {
+        let state = make_state();
+
+        // Create 3 rules
+        for cat in &["code_gen", "docs", "qa"] {
+            let rule = RoutingRule {
+                id: String::new(),
+                priority: 0,
+                enabled: true,
+                category: cat.to_string(),
+                target_url: "https://example.com".to_string(),
+                model_override: String::new(),
+                label: String::new(),
+            };
+            let body = serde_json::to_vec(&rule).unwrap();
+            serve_routing_rules_create(&state, &body).await;
+        }
+
+        // Get IDs in current order
+        let rules = state.routing_rules.read().await.clone();
+        assert_eq!(rules.len(), 3);
+        let ids: Vec<String> = rules.iter().map(|r| r.id.clone()).collect();
+
+        // Reorder: reverse
+        let reversed: Vec<String> = ids.iter().rev().cloned().collect();
+        let body = serde_json::json!({"ids": reversed});
+        let resp = serve_routing_reorder(&state, &serde_json::to_vec(&body).unwrap()).await;
+        assert_eq!(resp.status(), 200);
+
+        // Check order in state
+        let rules = state.routing_rules.read().await;
+        assert_eq!(rules[0].id, ids[2]);
+        assert_eq!(rules[0].priority, 1);
+        assert_eq!(rules[2].id, ids[0]);
+        assert_eq!(rules[2].priority, 3);
+    }
+
+    #[tokio::test]
+    async fn serve_routing_test_success() {
+        // Spawn a mock classifier
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let io = TokioIo::new(stream);
+                let _ = http1::Builder::new()
+                    .serve_connection(io, service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                        Ok::<_, hyper::Error>(
+                            hyper::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(r#"{"content":[{"type":"text","text":"code_gen"}]}"#)))
+                                .unwrap()
+                        )
+                    }))
+                    .await;
+            }
+        });
+
+        let state = make_state();
+        // Configure routing with classifier pointing to mock
+        {
+            let mut config = state.routing_config.write().await;
+            config.enabled = true;
+            config.classifier_base_url = format!("http://{addr}");
+            config.classifier_api_key = "test".to_string();
+        }
+
+        let body = serde_json::json!({"prompt": "write me some code"});
+        let resp = serve_routing_test(&state, &serde_json::to_vec(&body).unwrap()).await;
+        assert_eq!(resp.status(), 200);
+        let bytes = resp_body_to_bytes(resp).await;
+        let obj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(obj["category"], "code_gen");
+    }
+
+    #[tokio::test]
+    async fn serve_routing_test_not_enabled_returns_error() {
+        let state = make_state();
+        // Routing disabled, no key
+        let body = serde_json::json!({"prompt": "test"});
+        let resp = serve_routing_test(&state, &serde_json::to_vec(&body).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

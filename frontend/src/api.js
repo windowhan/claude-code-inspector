@@ -77,6 +77,68 @@ export async function rejectRequest(id) {
   return r.json()
 }
 
+// ── Routing API ───────────────────────────────────────────────────────────────
+
+export async function getRoutingConfig() {
+  const r = await fetch(`${BASE}/api/routing/config`)
+  return r.json()
+}
+
+export async function saveRoutingConfig(config) {
+  const r = await fetch(`${BASE}/api/routing/config`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(config),
+  })
+  return r.json()
+}
+
+export async function getRoutingRules() {
+  const r = await fetch(`${BASE}/api/routing/rules`)
+  return r.json()
+}
+
+export async function createRoutingRule(rule) {
+  const r = await fetch(`${BASE}/api/routing/rules`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(rule),
+  })
+  return r.json()
+}
+
+export async function updateRoutingRule(id, rule) {
+  const r = await fetch(`${BASE}/api/routing/rules/${id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(rule),
+  })
+  return r.json()
+}
+
+export async function deleteRoutingRule(id) {
+  const r = await fetch(`${BASE}/api/routing/rules/${id}`, { method: 'DELETE' })
+  return r.json()
+}
+
+export async function reorderRoutingRules(ids) {
+  const r = await fetch(`${BASE}/api/routing/reorder`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  })
+  return r.json()
+}
+
+export async function testRoutingClassifier(prompt, system = '') {
+  const r = await fetch(`${BASE}/api/routing/test`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt, system }),
+  })
+  return r.json()
+}
+
 /** Connect to SSE stream and call cb on each event */
 export function connectEvents(cb) {
   let es
