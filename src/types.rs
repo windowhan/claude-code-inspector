@@ -97,6 +97,7 @@ impl Default for RoutingConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRule {
+    #[serde(default)]
     pub id:             String,
     pub priority:       i64,
     pub enabled:        bool,
