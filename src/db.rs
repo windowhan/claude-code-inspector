@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use crate::types::{RequestRecord, RoutingConfig, RoutingRule, SessionRecord, ClassifierApiFormat};
+use crate::types::{RequestRecord, RoutingConfig, RoutingRule, SessionRecord};
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.execute_batch("
@@ -37,8 +37,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             classifier_base_url   TEXT NOT NULL DEFAULT 'https://api.anthropic.com',
             classifier_api_key    TEXT NOT NULL DEFAULT '',
             classifier_model      TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001',
-            classifier_api_format TEXT NOT NULL DEFAULT 'anthropic',
-            categories            TEXT NOT NULL DEFAULT '[\"code_gen\",\"code_review\",\"docs\",\"qa\",\"other\"]',
             classifier_prompt     TEXT NOT NULL DEFAULT ''
         );
 
@@ -47,8 +45,11 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             priority       INTEGER NOT NULL DEFAULT 100,
             enabled        INTEGER NOT NULL DEFAULT 1,
             category       TEXT NOT NULL,
-            target_url     TEXT NOT NULL,
-            model_override TEXT NOT NULL DEFAULT '',
+            description    TEXT NOT NULL DEFAULT '',
+            target_url      TEXT NOT NULL,
+            api_key         TEXT NOT NULL DEFAULT '',
+            prompt_override TEXT NOT NULL DEFAULT '',
+            model_override  TEXT NOT NULL DEFAULT '',
             label          TEXT NOT NULL DEFAULT ''
         );
 
@@ -77,6 +78,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE requests ADD COLUMN routed_to_url TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add description column to routing_rules
+    let _ = conn.execute(
+        "ALTER TABLE routing_rules ADD COLUMN description TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add api_key column to routing_rules
+    let _ = conn.execute(
+        "ALTER TABLE routing_rules ADD COLUMN api_key TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add prompt_override column to routing_rules
+    let _ = conn.execute(
+        "ALTER TABLE routing_rules ADD COLUMN prompt_override TEXT NOT NULL DEFAULT ''", [],
     );
     Ok(())
 }
@@ -391,58 +404,32 @@ pub fn get_routing_config(conn: &Connection) -> Result<RoutingConfig> {
     )?;
     let mut stmt = conn.prepare(
         "SELECT enabled, classifier_base_url, classifier_api_key, classifier_model,
-                classifier_api_format, categories, classifier_prompt
+                classifier_prompt
          FROM routing_config WHERE id = 1"
     )?;
     let config = stmt.query_row([], |row| {
         let enabled: i32 = row.get(0)?;
-        let base_url: String = row.get(1)?;
-        let api_key: String = row.get(2)?;
-        let model: String = row.get(3)?;
-        let format_str: String = row.get(4)?;
-        let categories_json: String = row.get(5)?;
-        let prompt: String = row.get(6)?;
-        Ok((enabled, base_url, api_key, model, format_str, categories_json, prompt))
+        Ok(RoutingConfig {
+            enabled: enabled != 0,
+            classifier_base_url: row.get(1)?,
+            classifier_api_key: row.get(2)?,
+            classifier_model: row.get(3)?,
+            classifier_prompt: row.get(4)?,
+        })
     })?;
-
-    let (enabled, base_url, api_key, model, format_str, categories_json, prompt) = config;
-    let categories: Vec<String> = serde_json::from_str(&categories_json).unwrap_or_else(|_| {
-        vec!["code_gen".to_string(), "code_review".to_string(), "docs".to_string(), "qa".to_string(), "other".to_string()]
-    });
-    let api_format = match format_str.as_str() {
-        "open_ai" => ClassifierApiFormat::OpenAi,
-        _ => ClassifierApiFormat::Anthropic,
-    };
-
-    Ok(RoutingConfig {
-        enabled: enabled != 0,
-        classifier_base_url: base_url,
-        classifier_api_key: api_key,
-        classifier_model: model,
-        classifier_api_format: api_format,
-        categories,
-        classifier_prompt: prompt,
-    })
+    Ok(config)
 }
 
 pub fn save_routing_config(conn: &Connection, config: &RoutingConfig) -> Result<()> {
-    let categories_json = serde_json::to_string(&config.categories)?;
-    let format_str = match config.classifier_api_format {
-        ClassifierApiFormat::Anthropic => "anthropic",
-        ClassifierApiFormat::OpenAi => "open_ai",
-    };
     conn.execute(
         "INSERT OR REPLACE INTO routing_config
-         (id, enabled, classifier_base_url, classifier_api_key, classifier_model,
-          classifier_api_format, categories, classifier_prompt)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (id, enabled, classifier_base_url, classifier_api_key, classifier_model, classifier_prompt)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
         params![
             config.enabled as i32,
             config.classifier_base_url,
             config.classifier_api_key,
             config.classifier_model,
-            format_str,
-            categories_json,
             config.classifier_prompt,
         ],
     )?;
@@ -451,7 +438,7 @@ pub fn save_routing_config(conn: &Connection, config: &RoutingConfig) -> Result<
 
 pub fn get_routing_rules(conn: &Connection) -> Result<Vec<RoutingRule>> {
     let mut stmt = conn.prepare(
-        "SELECT id, priority, enabled, category, target_url, model_override, label
+        "SELECT id, priority, enabled, category, description, target_url, api_key, prompt_override, model_override, label
          FROM routing_rules ORDER BY priority ASC"
     )?;
     let rules = stmt.query_map([], |row| {
@@ -461,9 +448,12 @@ pub fn get_routing_rules(conn: &Connection) -> Result<Vec<RoutingRule>> {
             priority: row.get(1)?,
             enabled: enabled != 0,
             category: row.get(3)?,
-            target_url: row.get(4)?,
-            model_override: row.get(5)?,
-            label: row.get(6)?,
+            description: row.get::<_, String>(4).unwrap_or_default(),
+            target_url: row.get(5)?,
+            api_key: row.get::<_, String>(6).unwrap_or_default(),
+            prompt_override: row.get::<_, String>(7).unwrap_or_default(),
+            model_override: row.get(8)?,
+            label: row.get(9)?,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -472,14 +462,17 @@ pub fn get_routing_rules(conn: &Connection) -> Result<Vec<RoutingRule>> {
 
 pub fn insert_routing_rule(conn: &Connection, rule: &RoutingRule) -> Result<()> {
     conn.execute(
-        "INSERT INTO routing_rules (id, priority, enabled, category, target_url, model_override, label)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO routing_rules (id, priority, enabled, category, description, target_url, api_key, prompt_override, model_override, label)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             rule.id,
             rule.priority,
             rule.enabled as i32,
             rule.category,
+            rule.description,
             rule.target_url,
+            rule.api_key,
+            rule.prompt_override,
             rule.model_override,
             rule.label,
         ],
@@ -490,14 +483,17 @@ pub fn insert_routing_rule(conn: &Connection, rule: &RoutingRule) -> Result<()> 
 pub fn update_routing_rule(conn: &Connection, rule: &RoutingRule) -> Result<()> {
     conn.execute(
         "UPDATE routing_rules SET
-         priority = ?1, enabled = ?2, category = ?3, target_url = ?4,
-         model_override = ?5, label = ?6
-         WHERE id = ?7",
+         priority = ?1, enabled = ?2, category = ?3, description = ?4, target_url = ?5,
+         api_key = ?6, prompt_override = ?7, model_override = ?8, label = ?9
+         WHERE id = ?10",
         params![
             rule.priority,
             rule.enabled as i32,
             rule.category,
+            rule.description,
             rule.target_url,
+            rule.api_key,
+            rule.prompt_override,
             rule.model_override,
             rule.label,
             rule.id,
@@ -578,7 +574,10 @@ mod tests {
             priority,
             enabled: true,
             category: category.to_string(),
+            description: format!("description for {category}"),
             target_url: "https://openai.com".to_string(),
+            api_key: String::new(),
+            prompt_override: String::new(),
             model_override: "gpt-4".to_string(),
             label: format!("rule-{id}"),
         }
@@ -955,29 +954,26 @@ mod tests {
         let config = get_routing_config(&conn).unwrap();
         assert!(!config.enabled);
         assert_eq!(config.classifier_model, "claude-haiku-4-5-20251001");
-        assert_eq!(config.classifier_api_format, ClassifierApiFormat::Anthropic);
 
         // Save a custom config
         let mut custom = config.clone();
         custom.enabled = true;
         custom.classifier_model = "gpt-4".to_string();
-        custom.classifier_api_format = ClassifierApiFormat::OpenAi;
         save_routing_config(&conn, &custom).unwrap();
 
         let loaded = get_routing_config(&conn).unwrap();
         assert!(loaded.enabled);
         assert_eq!(loaded.classifier_model, "gpt-4");
-        assert_eq!(loaded.classifier_api_format, ClassifierApiFormat::OpenAi);
     }
 
     #[test]
-    fn routing_config_categories_round_trip() {
+    fn routing_config_prompt_round_trip() {
         let conn = setup();
         let mut cfg = RoutingConfig::default();
-        cfg.categories = vec!["cat_a".to_string(), "cat_b".to_string()];
+        cfg.classifier_prompt = "Custom prompt".to_string();
         save_routing_config(&conn, &cfg).unwrap();
         let loaded = get_routing_config(&conn).unwrap();
-        assert_eq!(loaded.categories, vec!["cat_a", "cat_b"]);
+        assert_eq!(loaded.classifier_prompt, "Custom prompt");
     }
 
     #[test]

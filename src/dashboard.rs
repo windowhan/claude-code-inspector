@@ -472,7 +472,8 @@ async fn serve_routing_test(state: &AppState, body: &[u8]) -> Response<Full<Byte
     }
     let request_body = serde_json::json!({"messages": messages});
 
-    let category = routing::classify_intent(&config, "", &request_body).await;
+    let rules = state.routing_rules.read().await;
+    let category = routing::classify_intent(&config, "", &request_body, &rules).await;
     json_response(serde_json::json!({"category": category}))
 }
 
@@ -511,7 +512,7 @@ fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::db;
-    use crate::types::{DashboardEvent, RequestRecord, RoutingConfig, RoutingRule, SessionRecord, ClassifierApiFormat};
+    use crate::types::{DashboardEvent, RequestRecord, RoutingConfig, RoutingRule, SessionRecord};
     use bytes::Bytes;
     use http_body_util::Full;
     use hyper::service::service_fn;
@@ -1010,8 +1011,6 @@ mod tests {
             classifier_base_url: "https://openai.com".to_string(),
             classifier_api_key: "sk-test".to_string(),
             classifier_model: "gpt-4".to_string(),
-            classifier_api_format: ClassifierApiFormat::OpenAi,
-            categories: vec!["code".to_string(), "other".to_string()],
             classifier_prompt: "custom prompt".to_string(),
         };
         let body = serde_json::to_vec(&new_config).unwrap();
@@ -1077,7 +1076,10 @@ mod tests {
             priority: 5,
             enabled: false,
             category: "docs".to_string(),
+            description: String::new(),
             target_url: "https://updated.com".to_string(),
+            api_key: String::new(),
+            prompt_override: String::new(),
             model_override: String::new(),
             label: "updated".to_string(),
         };
@@ -1112,7 +1114,10 @@ mod tests {
                 priority: 0,
                 enabled: true,
                 category: cat.to_string(),
+                description: String::new(),
                 target_url: "https://example.com".to_string(),
+                api_key: String::new(),
+                prompt_override: String::new(),
                 model_override: String::new(),
                 label: String::new(),
             };
@@ -1153,7 +1158,7 @@ mod tests {
                             hyper::Response::builder()
                                 .status(200)
                                 .header("content-type", "application/json")
-                                .body(Full::new(Bytes::from(r#"{"content":[{"type":"text","text":"code_gen"}]}"#)))
+                                .body(Full::new(Bytes::from(r#"{"choices":[{"message":{"content":"code_gen"}}]}"#)))
                                 .unwrap()
                         )
                     }))
@@ -1168,6 +1173,22 @@ mod tests {
             config.enabled = true;
             config.classifier_base_url = format!("http://{addr}");
             config.classifier_api_key = "test".to_string();
+        }
+        // Seed a routing rule so categories_from_rules returns ["code_gen"]
+        {
+            let mut rules = state.routing_rules.write().await;
+            rules.push(crate::types::RoutingRule {
+                id: "test-rule-1".to_string(),
+                priority: 1,
+                enabled: true,
+                category: "code_gen".to_string(),
+                description: "Writing new code".to_string(),
+                target_url: "https://api.anthropic.com".to_string(),
+                api_key: String::new(),
+                prompt_override: String::new(),
+                model_override: String::new(),
+                label: "Code Gen".to_string(),
+            });
         }
 
         let body = serde_json::json!({"prompt": "write me some code"});

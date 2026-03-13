@@ -132,10 +132,6 @@ function renderRoutingPanel() {
   const cfg = routingConfig || {}
   const rules = routingRules
 
-  const formatOptions = ['anthropic', 'open_ai'].map(f =>
-    `<option value="${f}" ${(cfg.classifier_api_format || 'anthropic') === f ? 'selected' : ''}>${f === 'anthropic' ? 'Anthropic' : 'OpenAI'}</option>`
-  ).join('')
-
   const rulesHtml = rules.map((rule, idx) => `
     <div class="rule-row ${rule.enabled ? '' : 'disabled'}" data-rule-id="${esc(rule.id)}">
       <button class="btn btn-sm" data-rule-up="${idx}" title="Move up" ${idx === 0 ? 'disabled' : ''}>↑</button>
@@ -163,20 +159,12 @@ function renderRoutingPanel() {
           <input type="text" class="memo-input" id="rBaseUrl" value="${esc(cfg.classifier_base_url || 'https://api.anthropic.com')}" style="flex:1">
         </div>
         <div class="meta-row">
-          <span class="meta-label">API Format</span>
-          <select id="rFormat" class="memo-input" style="flex:1">${formatOptions}</select>
-        </div>
-        <div class="meta-row">
           <span class="meta-label">Model</span>
           <input type="text" class="memo-input" id="rModel" value="${esc(cfg.classifier_model || 'claude-haiku-4-5-20251001')}" style="flex:1">
         </div>
         <div class="meta-row">
           <span class="meta-label">API Key</span>
           <input type="password" class="memo-input" id="rApiKey" value="${esc(cfg.classifier_api_key || '')}" placeholder="Leave empty to use proxy key" style="flex:1">
-        </div>
-        <div class="meta-row">
-          <span class="meta-label">Categories</span>
-          <input type="text" class="memo-input" id="rCategories" value="${esc((cfg.categories || []).join(', '))}" placeholder="code_gen, docs, qa, other" style="flex:1">
         </div>
         <div class="meta-row" style="align-items:flex-start">
           <span class="meta-label">System Prompt</span>
@@ -193,8 +181,12 @@ function renderRoutingPanel() {
             <input type="text" class="memo-input" id="rfCategory" placeholder="code_gen" style="flex:1">
           </div>
           <div class="meta-row">
-            <span class="meta-label">Target URL</span>
+            <span class="meta-label">API Endpoint</span>
             <input type="text" class="memo-input" id="rfTargetUrl" placeholder="https://api.openai.com" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">API Key</span>
+            <input type="password" class="memo-input" id="rfApiKey" placeholder="Leave empty to use proxy key" style="flex:1">
           </div>
           <div class="meta-row">
             <span class="meta-label">Model Override</span>
@@ -202,7 +194,15 @@ function renderRoutingPanel() {
           </div>
           <div class="meta-row">
             <span class="meta-label">Label</span>
-            <input type="text" class="memo-input" id="rfLabel" placeholder="description (optional)" style="flex:1">
+            <input type="text" class="memo-input" id="rfLabel" placeholder="Display name (optional)" style="flex:1">
+          </div>
+          <div class="meta-row" style="align-items:flex-start">
+            <span class="meta-label">Description</span>
+            <textarea class="memo-input" id="rfDescription" rows="2" placeholder="Describe when to use this route (helps classifier)" style="flex:1;resize:vertical"></textarea>
+          </div>
+          <div class="meta-row" style="align-items:flex-start">
+            <span class="meta-label">Prompt Override</span>
+            <textarea class="memo-input" id="rfPromptOverride" rows="3" placeholder="Optional. Use {original_prompt} to inject the original message. Leave empty to keep original." style="flex:1;resize:vertical"></textarea>
           </div>
           <div class="meta-row">
             <span class="meta-label">Enabled</span>
@@ -241,8 +241,6 @@ function renderRoutingPanel() {
       classifier_base_url: document.getElementById('rBaseUrl').value.trim(),
       classifier_api_key: document.getElementById('rApiKey').value.trim(),
       classifier_model: document.getElementById('rModel').value.trim(),
-      classifier_api_format: document.getElementById('rFormat').value,
-      categories: document.getElementById('rCategories').value.split(',').map(s => s.trim()).filter(Boolean),
       classifier_prompt: document.getElementById('rPrompt').value,
     }
     routingConfig = await saveRoutingConfig(newCfg)
@@ -266,8 +264,11 @@ function renderRoutingPanel() {
     document.getElementById('ruleForm').style.display = ''
     document.getElementById('rfCategory').value = ''
     document.getElementById('rfTargetUrl').value = ''
+    document.getElementById('rfApiKey').value = ''
     document.getElementById('rfModelOverride').value = ''
     document.getElementById('rfLabel').value = ''
+    document.getElementById('rfDescription').value = ''
+    document.getElementById('rfPromptOverride').value = ''
     document.getElementById('rfEnabled').checked = true
   })
 
@@ -318,8 +319,11 @@ function renderRoutingPanel() {
       document.getElementById('ruleForm').style.display = ''
       document.getElementById('rfCategory').value = rule.category
       document.getElementById('rfTargetUrl').value = rule.target_url
+      document.getElementById('rfApiKey').value = rule.api_key || ''
       document.getElementById('rfModelOverride').value = rule.model_override || ''
       document.getElementById('rfLabel').value = rule.label || ''
+      document.getElementById('rfDescription').value = rule.description || ''
+      document.getElementById('rfPromptOverride').value = rule.prompt_override || ''
       document.getElementById('rfEnabled').checked = rule.enabled
     })
   })
@@ -347,8 +351,11 @@ function renderRoutingPanel() {
       enabled: document.getElementById('rfEnabled').checked,
       category,
       target_url: targetUrl,
+      api_key: document.getElementById('rfApiKey').value.trim(),
+      prompt_override: document.getElementById('rfPromptOverride').value,
       model_override: document.getElementById('rfModelOverride').value.trim(),
       label: document.getElementById('rfLabel').value.trim(),
+      description: document.getElementById('rfDescription').value.trim(),
     }
     if (editingRuleId === 'new') {
       await createRoutingRule(ruleData)

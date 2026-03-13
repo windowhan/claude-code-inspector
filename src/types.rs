@@ -56,26 +56,13 @@ pub struct DashboardEvent {
     pub data: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ClassifierApiFormat {
-    Anthropic,
-    OpenAi,
-}
-
-impl Default for ClassifierApiFormat {
-    fn default() -> Self { ClassifierApiFormat::Anthropic }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingConfig {
-    pub enabled:               bool,
-    pub classifier_base_url:   String,
-    pub classifier_api_key:    String,
-    pub classifier_model:      String,
-    pub classifier_api_format: ClassifierApiFormat,
-    pub categories:            Vec<String>,
-    pub classifier_prompt:     String,
+    pub enabled:             bool,
+    pub classifier_base_url: String,
+    pub classifier_api_key:  String,
+    pub classifier_model:    String,
+    pub classifier_prompt:   String,
 }
 
 impl Default for RoutingConfig {
@@ -85,11 +72,6 @@ impl Default for RoutingConfig {
             classifier_base_url: "https://api.anthropic.com".to_string(),
             classifier_api_key: String::new(),
             classifier_model: "claude-haiku-4-5-20251001".to_string(),
-            classifier_api_format: ClassifierApiFormat::Anthropic,
-            categories: vec![
-                "code_gen".to_string(), "code_review".to_string(),
-                "docs".to_string(), "qa".to_string(), "other".to_string(),
-            ],
             classifier_prompt: String::new(),
         }
     }
@@ -102,7 +84,13 @@ pub struct RoutingRule {
     pub priority:       i64,
     pub enabled:        bool,
     pub category:       String,
+    #[serde(default)]
+    pub description:    String,
     pub target_url:     String,
+    #[serde(default)]
+    pub api_key:        String,
+    #[serde(default)]
+    pub prompt_override: String,
     pub model_override: String,
     pub label:          String,
 }
@@ -240,20 +228,8 @@ mod tests {
         let cfg = RoutingConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.classifier_base_url, "https://api.anthropic.com");
-        assert_eq!(cfg.classifier_api_format, ClassifierApiFormat::Anthropic);
-        assert!(cfg.categories.contains(&"code_gen".to_string()));
-        assert!(cfg.categories.contains(&"other".to_string()));
-    }
-
-    #[test]
-    fn classifier_api_format_serializes() {
-        let fmt = ClassifierApiFormat::OpenAi;
-        let s = serde_json::to_string(&fmt).unwrap();
-        assert_eq!(s, "\"open_ai\"");
-
-        let fmt2 = ClassifierApiFormat::Anthropic;
-        let s2 = serde_json::to_string(&fmt2).unwrap();
-        assert_eq!(s2, "\"anthropic\"");
+        assert_eq!(cfg.classifier_model, "claude-haiku-4-5-20251001");
+        assert!(cfg.classifier_prompt.is_empty());
     }
 
     #[test]
@@ -263,7 +239,10 @@ mod tests {
             priority: 10,
             enabled: true,
             category: "code_gen".to_string(),
+            description: "Writing new code".to_string(),
             target_url: "https://openai.com".to_string(),
+            api_key: String::new(),
+            prompt_override: String::new(),
             model_override: "gpt-4".to_string(),
             label: "GPT-4 for code".to_string(),
         };

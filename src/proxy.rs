@@ -284,33 +284,41 @@ async fn handle_inner(
     }
 
     // ── Routing decision ─────────────────────────────────────────────────────
-    let (resolved_base_url, final_body_bytes, routing_category, routed_to_url) = {
+    let (resolved_base_url, final_body_bytes, routing_category, routed_to_url, rule_api_key) = {
         let config = state.routing_config.read().await;
         if config.enabled {
             let body_val = serde_json::from_slice::<serde_json::Value>(&body_bytes)
                 .unwrap_or_default();
-            let category = routing::classify_intent(&config, &incoming_api_key, &body_val).await;
             let rules = state.routing_rules.read().await;
+            let category = routing::classify_intent(&config, &incoming_api_key, &body_val, &rules).await;
             match routing::match_rule(&rules, &category) {
                 Some(rule) => {
-                    let out_body = if rule.model_override.is_empty() {
-                        body_bytes.clone()
-                    } else {
-                        Bytes::from(routing::apply_model_override(&body_bytes, &rule.model_override))
-                    };
+                    let mut out_body = body_bytes.clone();
+                    if !rule.prompt_override.is_empty() {
+                        out_body = Bytes::from(routing::apply_prompt_override(&out_body, &rule.prompt_override));
+                    }
+                    if !rule.model_override.is_empty() {
+                        out_body = Bytes::from(routing::apply_model_override(&out_body, &rule.model_override));
+                    }
                     let routed = if rule.target_url != state.upstream_url {
                         rule.target_url.clone()
                     } else {
                         String::new()
                     };
-                    (rule.target_url.clone(), out_body, category, routed)
+                    (rule.target_url.clone(), out_body, category, routed, rule.api_key.clone())
                 }
-                None => (state.upstream_url.clone(), body_bytes.clone(), category, String::new()),
+                None => (state.upstream_url.clone(), body_bytes.clone(), category, String::new(), String::new()),
             }
         } else {
-            (state.upstream_url.clone(), body_bytes.clone(), String::new(), String::new())
+            (state.upstream_url.clone(), body_bytes.clone(), String::new(), String::new(), String::new())
         }
     };
+
+    // Override API key headers if the matched rule specifies its own key
+    if !rule_api_key.is_empty() {
+        upstream_headers.insert("x-api-key".to_string(), rule_api_key.clone());
+        upstream_headers.insert("authorization".to_string(), format!("Bearer {rule_api_key}"));
+    }
 
     // Update routing fields in DB if routing produced a category
     if !routing_category.is_empty() || !routed_to_url.is_empty() {
@@ -1119,7 +1127,7 @@ mod tests {
                             hyper::Response::builder()
                                 .status(200)
                                 .header("content-type", "application/json")
-                                .body(Full::new(Bytes::from(r#"{"content":[{"type":"text","text":"code_gen"}]}"#)))
+                                .body(Full::new(Bytes::from(r#"{"choices":[{"message":{"content":"code_gen"}}]}"#)))
                                 .unwrap()
                         )
                     }))
@@ -1146,7 +1154,10 @@ mod tests {
                 priority: 10,
                 enabled: true,
                 category: "code_gen".to_string(),
+                description: String::new(),
                 target_url: upstream.clone(),
+                api_key: String::new(),
+                prompt_override: String::new(),
                 model_override: String::new(),
                 label: "test".to_string(),
             });
