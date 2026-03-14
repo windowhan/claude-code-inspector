@@ -147,18 +147,29 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   opacity: 0.7;
 }
 .prev-messages-toggle {
-  padding: 8px 12px;
-  font-size: 12px;
-  color: var(--blue);
+  padding: 6px 12px;
+  font-size: 11px;
+  color: var(--text-muted);
   cursor: pointer;
   border: 1px dashed var(--border);
   border-radius: 4px;
-  margin: 8px 0;
+  margin: 4px 0;
   text-align: center;
+  background: var(--bg);
 }
-.prev-messages-toggle:hover { background: var(--bg3); }
+.prev-messages-toggle:hover { background: var(--bg3); color: var(--blue); }
 .prev-messages.hidden { display: none; }
-.prev-messages { opacity: 0.6; }
+.prev-messages { opacity: 0.45; border-left: 2px solid var(--border); padding-left: 8px; }
+.new-messages-divider {
+  text-align: center;
+  font-size: 11px;
+  color: var(--green);
+  padding: 6px 0;
+  margin: 4px 0 8px;
+  border-top: 1px solid var(--green);
+  opacity: 0.7;
+  letter-spacing: 0.05em;
+}
 .agent-badge {
   font-size: 10px;
   padding: 1px 5px;

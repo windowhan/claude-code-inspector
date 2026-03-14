@@ -94,6 +94,20 @@ async fn find_pid_for_port(port: u16) -> Option<i64> {
 }
 
 async fn find_cwd_for_pid(pid: i64) -> Option<String> {
+    // On Linux, try /proc/<pid>/cwd first (faster and more reliable than lsof)
+    #[cfg(target_os = "linux")]
+    {
+        let proc_path = format!("/proc/{}/cwd", pid);
+        if let Ok(path) = tokio::fs::read_link(&proc_path).await {
+            let path_str = path.to_string_lossy().to_string();
+            if !path_str.is_empty() && path_str.starts_with('/') {
+                debug!("/proc cwd for pid {}: {}", pid, path_str);
+                return Some(path_str);
+            }
+        }
+        debug!("/proc cwd failed for pid {}, falling back to lsof", pid);
+    }
+
     let output = tokio::task::spawn_blocking(move || {
         Command::new("lsof")
             .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-F", "n", "-n"])

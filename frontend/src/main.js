@@ -706,7 +706,7 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
           <div class="meta-row"><span class="meta-label">Model</span><span class="meta-val">${esc(model || '-')}</span></div>
           <div class="meta-row"><span class="meta-label">Input tokens</span><span class="meta-val">${req.input_tokens ?? '-'}</span></div>
           ${systemBlock}
-          ${prevMessageCount > 0 ? `<div class="prev-messages-toggle" id="prevMsgToggle">${prevMessageCount} previous messages hidden — click to show</div><div id="prevMsgContainer" class="prev-messages hidden">${messages.slice(0, prevMessageCount).map((m, i) => renderMsgBlock(m, i, fmtTime(msgTimestamps[i]))).join('')}</div>` : ''}
+          ${prevMessageCount > 0 ? `<div class="prev-messages-toggle" id="prevMsgToggle">▶ ${prevMessageCount} previous messages hidden</div><div id="prevMsgContainer" class="prev-messages hidden">${messages.slice(0, prevMessageCount).map((m, i) => renderMsgBlock(m, i, fmtTime(msgTimestamps[i]))).join('')}</div><div class="new-messages-divider">── New in this request ──</div>` : ''}
           ${(prevMessageCount > 0 ? messages.slice(prevMessageCount) : messages).map((m, i) => { const gi = prevMessageCount > 0 ? prevMessageCount + i : i; return renderMsgBlock(m, gi, fmtTime(msgTimestamps[gi])) }).join('') || '<div class="empty-msg" style="padding:12px 0">No messages</div>'}
         </div>
       </div>
@@ -745,8 +745,8 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
       const container = document.getElementById('prevMsgContainer')
       const hidden = container.classList.toggle('hidden')
       prevToggle.textContent = hidden
-        ? `${prevMessageCount} previous messages hidden — click to show`
-        : `${prevMessageCount} previous messages — click to hide`
+        ? `▶ ${prevMessageCount} previous messages hidden`
+        : `▼ ${prevMessageCount} previous messages shown`
     })
   }
 
@@ -844,59 +844,56 @@ async function loadRequests() {
 async function loadDetail(id) {
   const req = await getRequestDetail(id)
 
-  // Build per-message timestamp map by tracing session history.
-  // Each message index gets the timestamp of the request that first introduced it.
   let prevMessageCount = 0
-  const msgTimestamps = [] // msgTimestamps[i] = timestamp string for message i
+  const msgTimestamps = []
 
   let currentMessages = []
   try { currentMessages = JSON.parse(req.request_body).messages || [] } catch {}
   const totalMessages = currentMessages.length
 
   if (req.session_id) {
-    // Collect same-session requests older than (and including) current, sorted oldest→newest
-    const idx = requests.findIndex(r => r.id === id)
-    if (idx >= 0) {
-      const sessionReqs = requests
-        .slice(idx)  // idx and older (list is desc by time)
-        .filter(r => r.session_id === req.session_id)
-        .reverse()   // now oldest first
+    // Fetch all requests for this session directly from API (not relying on filtered requests list)
+    const sessionReqs = await getRequests(req.session_id, { limit: 500 })
 
-      // Walk through each request to find when each message index first appeared
-      let prevCount = 0
-      for (const sr of sessionReqs) {
-        let detail, msgCount
-        if (sr.id === id) {
-          // Current request — no extra fetch needed
-          msgCount = totalMessages
-          detail = req
-        } else {
-          try {
-            detail = await getRequestDetail(sr.id)
-            const body = JSON.parse(detail.request_body)
-            msgCount = (body.messages || []).length
-          } catch { continue }
-        }
-        // Messages from prevCount to msgCount-1 were introduced by this request
-        for (let i = prevCount; i < msgCount; i++) {
-          msgTimestamps[i] = detail.timestamp
-        }
-        prevCount = msgCount
-      }
+    // Sort by timestamp ascending (oldest first)
+    const sorted = [...sessionReqs].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
 
-      // prevMessageCount = messages from the request just before this one
-      const prevReq = requests.slice(idx + 1).find(r => r.session_id === req.session_id)
-      if (prevReq) {
+    // Find the current request's position
+    const curIdx = sorted.findIndex(r => r.id === id)
+
+    // Walk through each request up to current to build timestamp map
+    let prevCount = 0
+    for (let si = 0; si <= curIdx && si < sorted.length; si++) {
+      const sr = sorted[si]
+      let detail, msgCount
+      if (sr.id === id) {
+        msgCount = totalMessages
+        detail = req
+      } else {
         try {
-          const prevDetail = await getRequestDetail(prevReq.id)
-          const prevBody = JSON.parse(prevDetail.request_body)
-          prevMessageCount = (prevBody.messages || []).length
-        } catch {}
+          detail = await getRequestDetail(sr.id)
+          const body = JSON.parse(detail.request_body)
+          msgCount = (body.messages || []).length
+        } catch { continue }
       }
+      for (let i = prevCount; i < msgCount; i++) {
+        msgTimestamps[i] = detail.timestamp
+      }
+      prevCount = msgCount
+    }
+
+    // prevMessageCount = messages from the request just before this one
+    if (curIdx > 0) {
+      const prevReq = sorted[curIdx - 1]
+      try {
+        const prevDetail = await getRequestDetail(prevReq.id)
+        const prevBody = JSON.parse(prevDetail.request_body)
+        prevMessageCount = (prevBody.messages || []).length
+      } catch {}
     }
   }
 
-  // Fill any gaps (e.g. first request in session, or no history)
+  // Fill any gaps
   for (let i = 0; i < totalMessages; i++) {
     if (!msgTimestamps[i]) msgTimestamps[i] = req.timestamp
   }
