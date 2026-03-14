@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
+use tokio::sync::RwLock;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
@@ -45,6 +46,8 @@ pub struct RequestRecord {
     pub memo: String,
     pub agent_type: String,   // "main", "explore", "plan", "audit", "sub" etc.
     pub agent_task: String,   // short description of what the sub-agent is doing
+    pub routing_category: String,
+    pub routed_to_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,21 +56,73 @@ pub struct DashboardEvent {
     pub data: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    pub enabled:             bool,
+    pub classifier_base_url: String,
+    pub classifier_api_key:  String,
+    pub classifier_model:    String,
+    pub classifier_prompt:   String,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        RoutingConfig {
+            enabled: false,
+            classifier_base_url: "https://api.anthropic.com".to_string(),
+            classifier_api_key: String::new(),
+            classifier_model: "claude-haiku-4-5-20251001".to_string(),
+            classifier_prompt: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingRule {
+    #[serde(default)]
+    pub id:             String,
+    pub priority:       i64,
+    pub enabled:        bool,
+    pub category:       String,
+    #[serde(default)]
+    pub description:    String,
+    pub target_url:     String,
+    #[serde(default)]
+    pub api_key:        String,
+    #[serde(default)]
+    pub prompt_override: String,
+    pub model_override: String,
+    pub label:          String,
+}
+
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub event_tx: broadcast::Sender<DashboardEvent>,
     pub upstream_url: String,
     pub intercept_enabled: AtomicBool,
     pub intercepted: std::sync::Mutex<HashMap<String, oneshot::Sender<InterceptAction>>>,
+    pub routing_config: RwLock<RoutingConfig>,
+    pub routing_rules: RwLock<Vec<RoutingRule>>,
 }
 
 impl AppState {
-    /// Production constructor — forwards to real Anthropic API.
+    /// Production constructor — loads routing config/rules from DB.
     pub fn new(db: Connection, event_tx: broadcast::Sender<DashboardEvent>) -> Arc<Self> {
-        Self::with_upstream(db, event_tx, "https://api.anthropic.com".to_string())
+        let routing_config = crate::db::get_routing_config(&db).unwrap_or_default();
+        let routing_rules = crate::db::get_routing_rules(&db).unwrap_or_default();
+        Arc::new(AppState {
+            db: Arc::new(Mutex::new(db)),
+            event_tx,
+            upstream_url: "https://api.anthropic.com".to_string(),
+            intercept_enabled: AtomicBool::new(false),
+            intercepted: std::sync::Mutex::new(HashMap::new()),
+            routing_config: RwLock::new(routing_config),
+            routing_rules: RwLock::new(routing_rules),
+        })
     }
 
     /// Constructor with configurable upstream URL (used in tests).
+    #[allow(dead_code)]
     pub fn with_upstream(
         db: Connection,
         event_tx: broadcast::Sender<DashboardEvent>,
@@ -79,6 +134,8 @@ impl AppState {
             upstream_url,
             intercept_enabled: AtomicBool::new(false),
             intercepted: std::sync::Mutex::new(HashMap::new()),
+            routing_config: RwLock::new(RoutingConfig::default()),
+            routing_rules: RwLock::new(Vec::new()),
         })
     }
 }
@@ -148,6 +205,8 @@ mod tests {
             memo: String::new(),
             agent_type: "main".to_string(),
             agent_task: String::new(),
+            routing_category: String::new(),
+            routed_to_url: String::new(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("pending"));
@@ -162,5 +221,45 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("request_update"));
+    }
+
+    #[test]
+    fn routing_config_default_values() {
+        let cfg = RoutingConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.classifier_base_url, "https://api.anthropic.com");
+        assert_eq!(cfg.classifier_model, "claude-haiku-4-5-20251001");
+        assert!(cfg.classifier_prompt.is_empty());
+    }
+
+    #[test]
+    fn routing_rule_serialize_round_trip() {
+        let rule = RoutingRule {
+            id: "rule-1".to_string(),
+            priority: 10,
+            enabled: true,
+            category: "code_gen".to_string(),
+            description: "Writing new code".to_string(),
+            target_url: "https://openai.com".to_string(),
+            api_key: String::new(),
+            prompt_override: String::new(),
+            model_override: "gpt-4".to_string(),
+            label: "GPT-4 for code".to_string(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: RoutingRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "rule-1");
+        assert_eq!(back.priority, 10);
+        assert_eq!(back.model_override, "gpt-4");
+    }
+
+    #[test]
+    fn appstate_with_upstream_has_empty_routing() {
+        let state = make_state("http://mock");
+        // routing_config should be default (disabled)
+        let config = state.routing_config.try_read().unwrap();
+        assert!(!config.enabled);
+        let rules = state.routing_rules.try_read().unwrap();
+        assert!(rules.is_empty());
     }
 }

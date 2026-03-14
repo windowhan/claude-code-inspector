@@ -3,6 +3,7 @@ mod dashboard;
 mod intercept;
 mod mcp;
 mod proxy;
+mod routing;
 mod session;
 mod sse_tee;
 mod types;

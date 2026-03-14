@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
-use crate::types::{RequestRecord, SessionRecord};
+use crate::types::{RequestRecord, RoutingConfig, RoutingRule, SessionRecord};
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     conn.execute_batch("
@@ -31,6 +31,28 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             status           TEXT NOT NULL DEFAULT 'pending'
         );
 
+        CREATE TABLE IF NOT EXISTS routing_config (
+            id                    INTEGER PRIMARY KEY DEFAULT 1,
+            enabled               INTEGER NOT NULL DEFAULT 0,
+            classifier_base_url   TEXT NOT NULL DEFAULT 'https://api.anthropic.com',
+            classifier_api_key    TEXT NOT NULL DEFAULT '',
+            classifier_model      TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001',
+            classifier_prompt     TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS routing_rules (
+            id             TEXT PRIMARY KEY,
+            priority       INTEGER NOT NULL DEFAULT 100,
+            enabled        INTEGER NOT NULL DEFAULT 1,
+            category       TEXT NOT NULL,
+            description    TEXT NOT NULL DEFAULT '',
+            target_url      TEXT NOT NULL,
+            api_key         TEXT NOT NULL DEFAULT '',
+            prompt_override TEXT NOT NULL DEFAULT '',
+            model_override  TEXT NOT NULL DEFAULT '',
+            label          TEXT NOT NULL DEFAULT ''
+        );
+
         CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
     ")?;
@@ -49,6 +71,25 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // Migration: add agent_task column
     let _ = conn.execute(
         "ALTER TABLE requests ADD COLUMN agent_task TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add routing columns
+    let _ = conn.execute(
+        "ALTER TABLE requests ADD COLUMN routing_category TEXT NOT NULL DEFAULT ''", [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE requests ADD COLUMN routed_to_url TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add description column to routing_rules
+    let _ = conn.execute(
+        "ALTER TABLE routing_rules ADD COLUMN description TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add api_key column to routing_rules
+    let _ = conn.execute(
+        "ALTER TABLE routing_rules ADD COLUMN api_key TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add prompt_override column to routing_rules
+    let _ = conn.execute(
+        "ALTER TABLE routing_rules ADD COLUMN prompt_override TEXT NOT NULL DEFAULT ''", [],
     );
     Ok(())
 }
@@ -72,8 +113,8 @@ pub fn upsert_session(conn: &Connection, session: &SessionRecord) -> Result<()> 
 
 pub fn insert_request(conn: &Connection, req: &RequestRecord) -> Result<()> {
     conn.execute(
-        "INSERT INTO requests (id, session_id, timestamp, method, path, request_headers, request_body, is_streaming, status, agent_type, agent_task)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO requests (id, session_id, timestamp, method, path, request_headers, request_body, is_streaming, status, agent_type, agent_task, routing_category, routed_to_url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             req.id,
             req.session_id,
@@ -86,6 +127,8 @@ pub fn insert_request(conn: &Connection, req: &RequestRecord) -> Result<()> {
             req.status,
             req.agent_type,
             req.agent_task,
+            req.routing_category,
+            req.routed_to_url,
         ],
     )?;
     Ok(())
@@ -171,7 +214,8 @@ pub fn get_starred_requests(conn: &Connection, limit: i64, offset: i64) -> Resul
     let mut stmt = conn.prepare(
         "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                 response_status, response_headers, response_body, is_streaming,
-                input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task
+                input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                routing_category, routed_to_url
          FROM requests WHERE starred = 1
          ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
     )?;
@@ -249,7 +293,8 @@ pub fn get_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task
+                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                    routing_category, routed_to_url
              FROM requests WHERE session_id = ?1
              ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
         )?;
@@ -260,7 +305,8 @@ pub fn get_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task
+                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                    routing_category, routed_to_url
              FROM requests
              ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
         )?;
@@ -283,7 +329,8 @@ pub fn search_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task
+                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                    routing_category, routed_to_url
              FROM requests
              WHERE session_id = ?1
                AND (request_body LIKE ?2 OR response_body LIKE ?2 OR path LIKE ?2)
@@ -296,7 +343,8 @@ pub fn search_requests(
         let mut stmt = conn.prepare(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task
+                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                    routing_category, routed_to_url
              FROM requests
              WHERE request_body LIKE ?1 OR response_body LIKE ?1 OR path LIKE ?1
              ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
@@ -312,7 +360,8 @@ pub fn get_request_by_id(conn: &Connection, id: &str) -> Result<Option<RequestRe
     let mut stmt = conn.prepare(
         "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                 response_status, response_headers, response_body, is_streaming,
-                input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task
+                input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                routing_category, routed_to_url
          FROM requests WHERE id = ?1"
     )?;
     let mut rows = stmt.query_map(params![id], map_request_row)?;
@@ -340,7 +389,133 @@ fn map_request_row(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
         memo: row.get::<_, String>(16).unwrap_or_default(),
         agent_type: row.get::<_, String>(17).unwrap_or_else(|_| "main".to_string()),
         agent_task: row.get::<_, String>(18).unwrap_or_default(),
+        routing_category: row.get::<_, String>(19).unwrap_or_default(),
+        routed_to_url: row.get::<_, String>(20).unwrap_or_default(),
     })
+}
+
+// ── Routing config CRUD ───────────────────────────────────────────────────────
+
+pub fn get_routing_config(conn: &Connection) -> Result<RoutingConfig> {
+    // Ensure a default row exists
+    conn.execute(
+        "INSERT OR IGNORE INTO routing_config (id) VALUES (1)",
+        [],
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT enabled, classifier_base_url, classifier_api_key, classifier_model,
+                classifier_prompt
+         FROM routing_config WHERE id = 1"
+    )?;
+    let config = stmt.query_row([], |row| {
+        let enabled: i32 = row.get(0)?;
+        Ok(RoutingConfig {
+            enabled: enabled != 0,
+            classifier_base_url: row.get(1)?,
+            classifier_api_key: row.get(2)?,
+            classifier_model: row.get(3)?,
+            classifier_prompt: row.get(4)?,
+        })
+    })?;
+    Ok(config)
+}
+
+pub fn save_routing_config(conn: &Connection, config: &RoutingConfig) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO routing_config
+         (id, enabled, classifier_base_url, classifier_api_key, classifier_model, classifier_prompt)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            config.enabled as i32,
+            config.classifier_base_url,
+            config.classifier_api_key,
+            config.classifier_model,
+            config.classifier_prompt,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_routing_rules(conn: &Connection) -> Result<Vec<RoutingRule>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, priority, enabled, category, description, target_url, api_key, prompt_override, model_override, label
+         FROM routing_rules ORDER BY priority ASC"
+    )?;
+    let rules = stmt.query_map([], |row| {
+        let enabled: i32 = row.get(2)?;
+        Ok(RoutingRule {
+            id: row.get(0)?,
+            priority: row.get(1)?,
+            enabled: enabled != 0,
+            category: row.get(3)?,
+            description: row.get::<_, String>(4).unwrap_or_default(),
+            target_url: row.get(5)?,
+            api_key: row.get::<_, String>(6).unwrap_or_default(),
+            prompt_override: row.get::<_, String>(7).unwrap_or_default(),
+            model_override: row.get(8)?,
+            label: row.get(9)?,
+        })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rules)
+}
+
+pub fn insert_routing_rule(conn: &Connection, rule: &RoutingRule) -> Result<()> {
+    conn.execute(
+        "INSERT INTO routing_rules (id, priority, enabled, category, description, target_url, api_key, prompt_override, model_override, label)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            rule.id,
+            rule.priority,
+            rule.enabled as i32,
+            rule.category,
+            rule.description,
+            rule.target_url,
+            rule.api_key,
+            rule.prompt_override,
+            rule.model_override,
+            rule.label,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn update_routing_rule(conn: &Connection, rule: &RoutingRule) -> Result<()> {
+    conn.execute(
+        "UPDATE routing_rules SET
+         priority = ?1, enabled = ?2, category = ?3, description = ?4, target_url = ?5,
+         api_key = ?6, prompt_override = ?7, model_override = ?8, label = ?9
+         WHERE id = ?10",
+        params![
+            rule.priority,
+            rule.enabled as i32,
+            rule.category,
+            rule.description,
+            rule.target_url,
+            rule.api_key,
+            rule.prompt_override,
+            rule.model_override,
+            rule.label,
+            rule.id,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn delete_routing_rule(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM routing_rules WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Reassigns priority 1..N in the order given by `ids`.
+pub fn reorder_routing_rules(conn: &Connection, ids: &[String]) -> Result<()> {
+    for (i, id) in ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE routing_rules SET priority = ?1 WHERE id = ?2",
+            params![(i + 1) as i64, id],
+        )?;
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -388,6 +563,23 @@ mod tests {
             memo: String::new(),
             agent_type: "main".to_string(),
             agent_task: String::new(),
+            routing_category: String::new(),
+            routed_to_url: String::new(),
+        }
+    }
+
+    fn sample_rule(id: &str, priority: i64, category: &str) -> RoutingRule {
+        RoutingRule {
+            id: id.to_string(),
+            priority,
+            enabled: true,
+            category: category.to_string(),
+            description: format!("description for {category}"),
+            target_url: "https://openai.com".to_string(),
+            api_key: String::new(),
+            prompt_override: String::new(),
+            model_override: "gpt-4".to_string(),
+            label: format!("rule-{id}"),
         }
     }
 
@@ -403,6 +595,16 @@ mod tests {
         // Verify requests table exists
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        // Verify routing_config table
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM routing_config", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        // Verify routing_rules table
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM routing_rules", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
     }
@@ -741,5 +943,110 @@ mod tests {
         let sessions = get_sessions(&conn).unwrap();
         assert_eq!(sessions[0].id, "s2"); // most recent first
         assert_eq!(sessions[1].id, "s1");
+    }
+
+    // ── Routing config tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn routing_config_default_and_save() {
+        let conn = setup();
+        // get_routing_config returns default when no row inserted
+        let config = get_routing_config(&conn).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.classifier_model, "claude-haiku-4-5-20251001");
+
+        // Save a custom config
+        let mut custom = config.clone();
+        custom.enabled = true;
+        custom.classifier_model = "gpt-4".to_string();
+        save_routing_config(&conn, &custom).unwrap();
+
+        let loaded = get_routing_config(&conn).unwrap();
+        assert!(loaded.enabled);
+        assert_eq!(loaded.classifier_model, "gpt-4");
+    }
+
+    #[test]
+    fn routing_config_prompt_round_trip() {
+        let conn = setup();
+        let mut cfg = RoutingConfig::default();
+        cfg.classifier_prompt = "Custom prompt".to_string();
+        save_routing_config(&conn, &cfg).unwrap();
+        let loaded = get_routing_config(&conn).unwrap();
+        assert_eq!(loaded.classifier_prompt, "Custom prompt");
+    }
+
+    #[test]
+    fn routing_rules_insert_update_delete() {
+        let conn = setup();
+        let rule = sample_rule("rule-1", 10, "code_gen");
+        insert_routing_rule(&conn, &rule).unwrap();
+
+        let rules = get_routing_rules(&conn).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "rule-1");
+        assert_eq!(rules[0].category, "code_gen");
+
+        // Update
+        let mut updated = rule.clone();
+        updated.category = "docs".to_string();
+        updated.label = "updated".to_string();
+        update_routing_rule(&conn, &updated).unwrap();
+
+        let rules = get_routing_rules(&conn).unwrap();
+        assert_eq!(rules[0].category, "docs");
+        assert_eq!(rules[0].label, "updated");
+
+        // Delete
+        delete_routing_rule(&conn, "rule-1").unwrap();
+        let rules = get_routing_rules(&conn).unwrap();
+        assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn routing_rules_reorder_by_ids() {
+        let conn = setup();
+        insert_routing_rule(&conn, &sample_rule("r1", 1, "code_gen")).unwrap();
+        insert_routing_rule(&conn, &sample_rule("r2", 2, "docs")).unwrap();
+        insert_routing_rule(&conn, &sample_rule("r3", 3, "qa")).unwrap();
+
+        // Reorder: r3, r1, r2
+        reorder_routing_rules(&conn, &[
+            "r3".to_string(), "r1".to_string(), "r2".to_string(),
+        ]).unwrap();
+
+        let rules = get_routing_rules(&conn).unwrap();
+        // Ordered by priority asc: r3=1, r1=2, r2=3
+        assert_eq!(rules[0].id, "r3");
+        assert_eq!(rules[0].priority, 1);
+        assert_eq!(rules[1].id, "r1");
+        assert_eq!(rules[1].priority, 2);
+        assert_eq!(rules[2].id, "r2");
+        assert_eq!(rules[2].priority, 3);
+    }
+
+    #[test]
+    fn routing_rules_ordered_by_priority() {
+        let conn = setup();
+        insert_routing_rule(&conn, &sample_rule("r-high", 100, "code_gen")).unwrap();
+        insert_routing_rule(&conn, &sample_rule("r-low", 10, "docs")).unwrap();
+
+        let rules = get_routing_rules(&conn).unwrap();
+        assert_eq!(rules[0].id, "r-low");  // priority 10 first
+        assert_eq!(rules[1].id, "r-high"); // priority 100 second
+    }
+
+    #[test]
+    fn requests_routing_columns_persist() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        let mut req = sample_request("r1", "s1");
+        req.routing_category = "code_gen".to_string();
+        req.routed_to_url = "https://openai.com".to_string();
+        insert_request(&conn, &req).unwrap();
+
+        let found = get_request_by_id(&conn, "r1").unwrap().unwrap();
+        assert_eq!(found.routing_category, "code_gen");
+        assert_eq!(found.routed_to_url, "https://openai.com");
     }
 }

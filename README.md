@@ -6,7 +6,7 @@ A single-binary tool that **transparently intercepts all requests/responses** be
 Claude Code ──HTTP──▶ Proxy :7878 ──HTTPS──▶ api.anthropic.com
                            │
                       SQLite DB
-               (~/Library/Application Support/claude-code-hook/logs.db)
+               (~/.local/share/claude-code-hook/logs.db)
                            │
               ┌────────────┴────────────┐
               ▼                         ▼
@@ -26,7 +26,7 @@ Claude Code ──HTTP──▶ Proxy :7878 ──HTTPS──▶ api.anthropic.c
 
 ---
 
-## Quick Install (macOS)
+## Quick Install
 
 ```bash
 git clone https://github.com/windowhan/claude-code-hook.git
@@ -34,18 +34,41 @@ cd claude-code-hook
 bash install.sh
 ```
 
-The script handles everything automatically:
+The script auto-detects your OS (macOS / Linux) and handles everything:
 
 1. Frontend build (`npm install && npm run build`)
 2. Rust binary build (`cargo build --release`)
 3. Binary installation (`~/.local/bin/claude-code-hook`)
-4. Permanent `ANTHROPIC_BASE_URL` setting (`~/.zshrc` or `~/.bash_profile`)
-5. macOS LaunchAgent registration (auto-start on login, KeepAlive)
+4. Permanent `ANTHROPIC_BASE_URL` setting (`~/.bashrc` or `~/.zshrc`)
+5. Auto-start registration:
+   - **Linux**: systemd user service (`systemctl --user`)
+   - **macOS**: LaunchAgent (`launchctl`)
 6. Claude Code MCP server registration
 
 ---
 
 ## Prerequisites
+
+### Ubuntu / Debian
+
+```bash
+# Build essentials + OpenSSL dev
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libssl-dev lsof curl
+
+# Rust (1.75+)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Node.js (18+) — optional, fallback UI used if absent
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+
+# Claude Code
+npm install -g @anthropic-ai/claude-code
+```
+
+### macOS
 
 | Tool | How to install |
 |------|----------------|
@@ -53,7 +76,7 @@ The script handles everything automatically:
 | **Node.js** (18+) | https://nodejs.org or `brew install node` |
 | **Claude Code** | `npm install -g @anthropic-ai/claude-code` |
 
-> Node.js is optional. If absent, the build falls back to a single-file HTML UI.
+> Node.js is optional on both platforms. If absent, the build falls back to a single-file HTML UI.
 
 ---
 
@@ -89,19 +112,18 @@ mkdir -p ~/.local/bin
 cp target/release/claude-code-hook ~/.local/bin/
 
 # Add ~/.local/bin to PATH if not already there
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ```
 
 ### 5. Set ANTHROPIC_BASE_URL permanently
 
-Add the environment variable to your shell config so Claude Code always routes through the proxy.
-
 ```bash
-echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:7878' >> ~/.zshrc
-source ~/.zshrc
+echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:7878' >> ~/.bashrc
+source ~/.bashrc
 ```
 
-> bash users: use `~/.bash_profile` or `~/.bashrc` instead of `~/.zshrc`.
+> zsh users: use `~/.zshrc` instead of `~/.bashrc`.
 
 ### 6. Start the server
 
@@ -110,7 +132,40 @@ source ~/.zshrc
 claude-code-hook
 ```
 
-**Auto-start via macOS LaunchAgent (on login):**
+**Auto-start via systemd (Linux):**
+```bash
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/claude-code-inspector.service <<EOF
+[Unit]
+Description=Claude Code LLM API Inspector
+After=network.target
+
+[Service]
+ExecStart=$HOME/.local/bin/claude-code-hook
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=claude_code_hook=info,warn
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable claude-code-inspector.service
+systemctl --user start claude-code-inspector.service
+```
+
+Useful commands:
+```bash
+systemctl --user status claude-code-inspector    # 상태 확인
+systemctl --user restart claude-code-inspector   # 재시작
+journalctl --user -u claude-code-inspector -f    # 로그 확인
+```
+
+<details>
+<summary><b>Auto-start via macOS LaunchAgent</b></summary>
+
 ```bash
 cat > ~/Library/LaunchAgents/com.claude-code-inspector.plist <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -137,6 +192,7 @@ EOF
 
 launchctl load ~/Library/LaunchAgents/com.claude-code-inspector.plist
 ```
+</details>
 
 ### 7. Register the MCP server (optional)
 
@@ -161,6 +217,10 @@ Available MCP tools after registration:
 Open in your browser after starting the server:
 
 ```bash
+# Linux
+xdg-open http://127.0.0.1:7879
+
+# macOS
 open http://127.0.0.1:7879
 ```
 
@@ -187,15 +247,21 @@ open http://127.0.0.1:7879
 
 ## How It Works
 
-### Session identification (macOS)
+### Session identification
 
 Multiple Claude Code processes running simultaneously are automatically separated into distinct sessions.
 
+**Linux:**
 1. TCP connection arrives at proxy → record client **source port**
 2. `lsof -i :<port>` → find the **PID** using that port
-3. `lsof -a -p <PID> -d cwd` → get the process **working directory**
-4. If an existing session with the same CWD exists, reuse it → subagents/background tasks are grouped into the same session
-5. `basename(CWD)` → extract project name (e.g. `/Users/foo/my-app` → `my-app`)
+3. `/proc/<PID>/cwd` (readlink) → get the process **working directory**
+4. If an existing session with the same CWD exists, reuse it → subagents/background tasks are grouped
+5. `basename(CWD)` → extract project name
+
+**macOS:**
+1. TCP connection → source port → `lsof` → PID
+2. `lsof -a -p <PID> -d cwd` → working directory
+3. Same CWD grouping + project name extraction
 
 ### Streaming handling
 
@@ -247,11 +313,13 @@ CREATE TABLE requests (
 );
 ```
 
-DB path: `~/Library/Application Support/claude-code-hook/logs.db` (macOS)
+DB path:
+- **Linux**: `~/.local/share/claude-code-hook/logs.db`
+- **macOS**: `~/Library/Application Support/claude-code-hook/logs.db`
 
 Direct query example:
 ```bash
-sqlite3 ~/Library/Application\ Support/claude-code-hook/logs.db \
+sqlite3 ~/.local/share/claude-code-hook/logs.db \
   "SELECT timestamp, input_tokens, output_tokens, status FROM requests ORDER BY timestamp DESC LIMIT 10;"
 ```
 
@@ -308,7 +376,10 @@ cd frontend && npm run build && cd ..
 cargo build --release
 cp target/release/claude-code-hook ~/.local/bin/claude-code-hook
 
-# Restart LaunchAgent
+# Linux: restart systemd service
+systemctl --user restart claude-code-inspector
+
+# macOS: restart LaunchAgent
 launchctl unload ~/Library/LaunchAgents/com.claude-code-inspector.plist
 launchctl load  ~/Library/LaunchAgents/com.claude-code-inspector.plist
 ```
@@ -317,7 +388,7 @@ launchctl load  ~/Library/LaunchAgents/com.claude-code-inspector.plist
 
 ```
 claude-code-hook/
-├── install.sh                   # automated install script
+├── install.sh                   # automated install script (macOS + Linux)
 ├── Cargo.toml
 ├── CLAUDE.md                    # development guidelines
 ├── frontend/
@@ -333,7 +404,7 @@ claude-code-hook/
     ├── db.rs                    # SQLite CRUD
     ├── proxy.rs                 # core proxy logic
     ├── sse_tee.rs               # SSE stream tee
-    ├── session.rs               # PID/CWD backtracking
+    ├── session.rs               # PID/CWD backtracking (Linux /proc + lsof)
     ├── dashboard.rs             # HTTP API server
     ├── mcp.rs                   # MCP stdio server
     └── assets/
@@ -347,16 +418,23 @@ claude-code-hook/
 
 **Server won't start:**
 ```bash
-# Check logs
+# Linux: check systemd logs
+journalctl --user -u claude-code-inspector --no-pager -n 50
+
+# macOS: check logs
 tail -f /tmp/claude-inspector.log
 
 # Check port availability
-lsof -i :7878
-lsof -i :7879
+ss -tlnp | grep -E '7878|7879'   # Linux
+lsof -i :7878                     # macOS
 ```
 
-**Restart LaunchAgent:**
+**Restart service:**
 ```bash
+# Linux
+systemctl --user restart claude-code-inspector
+
+# macOS
 launchctl unload ~/Library/LaunchAgents/com.claude-code-inspector.plist
 launchctl load   ~/Library/LaunchAgents/com.claude-code-inspector.plist
 ```

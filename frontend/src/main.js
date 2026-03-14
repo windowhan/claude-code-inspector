@@ -1,4 +1,4 @@
-import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest } from './api.js'
+import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest, getRoutingConfig, saveRoutingConfig, getRoutingRules, createRoutingRule, updateRoutingRule, deleteRoutingRule, reorderRoutingRules, testRoutingClassifier } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -9,6 +9,10 @@ let selectedRequest = null        // id string
 let interceptEnabled = false
 let searchQuery = ''
 let searchDebounceTimer = null
+let routingPanelOpen = false
+let routingConfig = null
+let routingRules = []
+let editingRuleId = null          // null = not editing, 'new' = adding new
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 document.querySelector('#app').innerHTML = `
@@ -18,6 +22,9 @@ document.querySelector('#app').innerHTML = `
   <button class="intercept-toggle" id="interceptToggle" title="Toggle request interception">
     <span class="intercept-dot" id="interceptDot"></span>
     <span id="interceptLabel">Intercept</span>
+  </button>
+  <button class="routing-btn" id="routingBtn" title="Configure multi-provider routing">
+    <span id="routingLabel">⇄ Routes</span>
   </button>
   <span class="header-meta" id="hMeta">Loading…</span>
 </header>
@@ -44,6 +51,8 @@ document.querySelector('#app').innerHTML = `
 const $interceptToggle = document.getElementById('interceptToggle')
 const $interceptDot    = document.getElementById('interceptDot')
 const $interceptLabel  = document.getElementById('interceptLabel')
+const $routingBtn      = document.getElementById('routingBtn')
+const $routingLabel    = document.getElementById('routingLabel')
 const $hMeta       = document.getElementById('hMeta')
 const $sessionList = document.getElementById('sessionList')
 const $reqCount    = document.getElementById('reqCount')
@@ -95,6 +104,291 @@ $interceptToggle.addEventListener('click', async () => {
   interceptEnabled = res.enabled
   renderInterceptToggle()
 })
+
+// ── Routing UI ────────────────────────────────────────────────────────────────
+function renderRoutingBtn() {
+  const enabledRuleCount = routingRules.filter(r => r.enabled).length
+  const label = `⇄ Routes${enabledRuleCount > 0 ? ' · ' + enabledRuleCount : ''}`
+  $routingLabel.textContent = label
+  const isActive = routingConfig && routingConfig.enabled && routingRules.length > 0
+  $routingBtn.classList.toggle('active', isActive)
+}
+
+$routingBtn.addEventListener('click', () => {
+  routingPanelOpen = !routingPanelOpen
+  if (routingPanelOpen) {
+    renderRoutingPanel()
+  } else {
+    if (selectedRequest) {
+      loadDetail(selectedRequest)
+    } else {
+      $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
+    }
+  }
+})
+
+function renderRoutingPanel() {
+  if (!routingPanelOpen) return
+  const cfg = routingConfig || {}
+  const rules = routingRules
+
+  const rulesHtml = rules.map((rule, idx) => `
+    <div class="rule-row ${rule.enabled ? '' : 'disabled'}" data-rule-id="${esc(rule.id)}">
+      <button class="btn btn-sm" data-rule-up="${idx}" title="Move up" ${idx === 0 ? 'disabled' : ''}>↑</button>
+      <button class="btn btn-sm" data-rule-down="${idx}" title="Move down" ${idx === rules.length - 1 ? 'disabled' : ''}>↓</button>
+      <input type="checkbox" class="rule-enabled-cb" data-rule-id="${esc(rule.id)}" ${rule.enabled ? 'checked' : ''} title="Enable/Disable">
+      <span class="routing-badge">${esc(rule.category)}</span>
+      <span style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(rule.target_url)}">${esc(rule.target_url)}</span>
+      ${rule.model_override ? `<span style="font-size:11px;color:var(--text-muted)">${esc(rule.model_override)}</span>` : ''}
+      ${rule.label ? `<span style="font-size:11px;color:var(--yellow)">${esc(rule.label)}</span>` : ''}
+      <button class="btn btn-sm" data-rule-edit="${esc(rule.id)}">Edit</button>
+      <button class="btn btn-sm btn-danger" data-rule-del="${esc(rule.id)}">✕</button>
+    </div>
+  `).join('')
+
+  $detail.innerHTML = `
+    <div class="routing-panel">
+      <div class="routing-section">
+        <h3>Classifier Settings</h3>
+        <div class="meta-row">
+          <span class="meta-label">Enabled</span>
+          <input type="checkbox" id="rEnabled" ${cfg.enabled ? 'checked' : ''}>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Provider URL</span>
+          <input type="text" class="memo-input" id="rBaseUrl" value="${esc(cfg.classifier_base_url || 'https://api.anthropic.com')}" style="flex:1">
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Model</span>
+          <input type="text" class="memo-input" id="rModel" value="${esc(cfg.classifier_model || 'claude-haiku-4-5-20251001')}" style="flex:1">
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">API Key</span>
+          <input type="password" class="memo-input" id="rApiKey" value="${esc(cfg.classifier_api_key || '')}" placeholder="Leave empty to use proxy key" style="flex:1">
+        </div>
+        <div class="meta-row" style="align-items:flex-start">
+          <span class="meta-label">System Prompt</span>
+          <textarea class="intercept-textarea" id="rPrompt" rows="3" style="flex:1;min-height:60px">${esc(cfg.classifier_prompt || '')}</textarea>
+        </div>
+      </div>
+
+      <div class="routing-section">
+        <h3>Routing Rules <button class="btn btn-sm" id="addRuleBtn" style="margin-left:8px">+ Add Rule</button></h3>
+        <div id="rulesList">${rulesHtml || '<div class="empty-msg" style="padding:8px 0;font-size:12px">No rules yet</div>'}</div>
+        <div id="ruleForm" style="display:none;margin-top:8px;padding:8px;background:var(--bg3);border-radius:6px;border:1px solid var(--border)">
+          <div class="meta-row">
+            <span class="meta-label">Category</span>
+            <input type="text" class="memo-input" id="rfCategory" placeholder="code_gen" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">API Endpoint</span>
+            <input type="text" class="memo-input" id="rfTargetUrl" placeholder="https://api.openai.com" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">API Key</span>
+            <input type="password" class="memo-input" id="rfApiKey" placeholder="Leave empty to use proxy key" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Model Override</span>
+            <input type="text" class="memo-input" id="rfModelOverride" placeholder="gpt-4 (optional)" style="flex:1">
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Label</span>
+            <input type="text" class="memo-input" id="rfLabel" placeholder="Display name (optional)" style="flex:1">
+          </div>
+          <div class="meta-row" style="align-items:flex-start">
+            <span class="meta-label">Description</span>
+            <textarea class="memo-input" id="rfDescription" rows="2" placeholder="Describe when to use this route (helps classifier)" style="flex:1;resize:vertical"></textarea>
+          </div>
+          <div class="meta-row" style="align-items:flex-start">
+            <span class="meta-label">Prompt Override</span>
+            <textarea class="memo-input" id="rfPromptOverride" rows="3" placeholder="Optional. Use {original_prompt} to inject the original message. Leave empty to keep original." style="flex:1;resize:vertical"></textarea>
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Enabled</span>
+            <input type="checkbox" id="rfEnabled" checked>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button class="btn btn-primary" id="rfSaveBtn">Save Rule</button>
+            <button class="btn" id="rfCancelBtn">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="routing-section">
+        <h3>Test Classifier</h3>
+        <div class="meta-row" style="align-items:flex-start">
+          <span class="meta-label">Prompt</span>
+          <textarea class="intercept-textarea" id="rTestPrompt" rows="2" style="flex:1;min-height:50px" placeholder="Enter a test prompt…"></textarea>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+          <button class="btn btn-primary" id="rTestBtn">Test</button>
+          <span id="rTestResult" style="font-size:13px;color:var(--text-muted)"></span>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;display:flex;gap:8px">
+        <button class="btn btn-primary" id="rSaveAllBtn">Save All Settings</button>
+        <button class="btn" id="rCloseBtn">Close</button>
+      </div>
+    </div>
+  `
+
+  // Save all settings
+  document.getElementById('rSaveAllBtn').addEventListener('click', async () => {
+    const newCfg = {
+      enabled: document.getElementById('rEnabled').checked,
+      classifier_base_url: document.getElementById('rBaseUrl').value.trim(),
+      classifier_api_key: document.getElementById('rApiKey').value.trim(),
+      classifier_model: document.getElementById('rModel').value.trim(),
+      classifier_prompt: document.getElementById('rPrompt').value,
+    }
+    routingConfig = await saveRoutingConfig(newCfg)
+    renderRoutingBtn()
+    renderRoutingPanel()
+  })
+
+  // Close
+  document.getElementById('rCloseBtn').addEventListener('click', () => {
+    routingPanelOpen = false
+    if (selectedRequest) {
+      loadDetail(selectedRequest)
+    } else {
+      $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
+    }
+  })
+
+  // Add rule button
+  document.getElementById('addRuleBtn').addEventListener('click', () => {
+    editingRuleId = 'new'
+    document.getElementById('ruleForm').style.display = ''
+    document.getElementById('rfCategory').value = ''
+    document.getElementById('rfTargetUrl').value = ''
+    document.getElementById('rfApiKey').value = ''
+    document.getElementById('rfModelOverride').value = ''
+    document.getElementById('rfLabel').value = ''
+    document.getElementById('rfDescription').value = ''
+    document.getElementById('rfPromptOverride').value = ''
+    document.getElementById('rfEnabled').checked = true
+  })
+
+  // Rule up/down buttons
+  document.querySelectorAll('[data-rule-up]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const idx = parseInt(btn.dataset.ruleUp)
+      if (idx <= 0) return
+      const ids = routingRules.map(r => r.id)
+      ;[ids[idx - 1], ids[idx]] = [ids[idx], ids[idx - 1]]
+      routingRules = await reorderRoutingRules(ids)
+      renderRoutingPanel()
+    })
+  })
+
+  document.querySelectorAll('[data-rule-down]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const idx = parseInt(btn.dataset.ruleDown)
+      if (idx >= routingRules.length - 1) return
+      const ids = routingRules.map(r => r.id)
+      ;[ids[idx], ids[idx + 1]] = [ids[idx + 1], ids[idx]]
+      routingRules = await reorderRoutingRules(ids)
+      renderRoutingPanel()
+    })
+  })
+
+  // Rule enable/disable checkboxes
+  document.querySelectorAll('.rule-enabled-cb').forEach(cb => {
+    cb.addEventListener('change', async () => {
+      const ruleId = cb.dataset.ruleId
+      const rule = routingRules.find(r => r.id === ruleId)
+      if (!rule) return
+      const updated = { ...rule, enabled: cb.checked }
+      await updateRoutingRule(ruleId, updated)
+      routingRules = await getRoutingRules()
+      renderRoutingBtn()
+      renderRoutingPanel()
+    })
+  })
+
+  // Rule edit buttons
+  document.querySelectorAll('[data-rule-edit]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const ruleId = btn.dataset.ruleEdit
+      const rule = routingRules.find(r => r.id === ruleId)
+      if (!rule) return
+      editingRuleId = ruleId
+      document.getElementById('ruleForm').style.display = ''
+      document.getElementById('rfCategory').value = rule.category
+      document.getElementById('rfTargetUrl').value = rule.target_url
+      document.getElementById('rfApiKey').value = rule.api_key || ''
+      document.getElementById('rfModelOverride').value = rule.model_override || ''
+      document.getElementById('rfLabel').value = rule.label || ''
+      document.getElementById('rfDescription').value = rule.description || ''
+      document.getElementById('rfPromptOverride').value = rule.prompt_override || ''
+      document.getElementById('rfEnabled').checked = rule.enabled
+    })
+  })
+
+  // Rule delete buttons
+  document.querySelectorAll('[data-rule-del]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const ruleId = btn.dataset.ruleDel
+      if (!confirm('Delete this routing rule?')) return
+      await deleteRoutingRule(ruleId)
+      routingRules = await getRoutingRules()
+      renderRoutingBtn()
+      renderRoutingPanel()
+    })
+  })
+
+  // Rule form save
+  document.getElementById('rfSaveBtn').addEventListener('click', async () => {
+    const category = document.getElementById('rfCategory').value.trim()
+    const targetUrl = document.getElementById('rfTargetUrl').value.trim()
+    if (!category || !targetUrl) { alert('Category and Target URL are required'); return }
+    const ruleData = {
+      id: editingRuleId || '',
+      priority: 0,
+      enabled: document.getElementById('rfEnabled').checked,
+      category,
+      target_url: targetUrl,
+      api_key: document.getElementById('rfApiKey').value.trim(),
+      prompt_override: document.getElementById('rfPromptOverride').value,
+      model_override: document.getElementById('rfModelOverride').value.trim(),
+      label: document.getElementById('rfLabel').value.trim(),
+      description: document.getElementById('rfDescription').value.trim(),
+    }
+    if (editingRuleId === 'new') {
+      await createRoutingRule(ruleData)
+    } else if (editingRuleId) {
+      await updateRoutingRule(editingRuleId, { ...ruleData, id: editingRuleId })
+    }
+    editingRuleId = null
+    routingRules = await getRoutingRules()
+    renderRoutingBtn()
+    renderRoutingPanel()
+  })
+
+  // Rule form cancel
+  document.getElementById('rfCancelBtn').addEventListener('click', () => {
+    editingRuleId = null
+    document.getElementById('ruleForm').style.display = 'none'
+  })
+
+  // Test classifier
+  document.getElementById('rTestBtn').addEventListener('click', async () => {
+    const prompt = document.getElementById('rTestPrompt').value.trim()
+    const result = document.getElementById('rTestResult')
+    result.textContent = 'Testing…'
+    const res = await testRoutingClassifier(prompt)
+    if (res.error) {
+      result.textContent = `Error: ${res.error}`
+      result.style.color = 'var(--red)'
+    } else {
+      result.textContent = `Category: ${res.category}`
+      result.style.color = 'var(--green)'
+    }
+  })
+}
 
 // ── Render ────────────────────────────────────────────────────────────────────
 function renderSessions() {
@@ -184,6 +478,7 @@ function renderRequests() {
         ${dur ? `<span title="Response time">${dur}</span>` : ''}
         ${r.is_streaming ? '<span class="req-tag streaming" title="Server-Sent Events streaming response">stream</span>' : '<span class="req-tag" title="Single JSON response">json</span>'}
         ${r.memo ? `<span class="req-memo" title="${esc(r.memo)}">${esc(r.memo)}</span>` : ''}
+        ${r.routing_category ? `<span class="routing-badge" title="Routed: ${esc(r.routing_category)}">${esc(r.routing_category)}</span>` : ''}
       </div>
     </div>`
   }
@@ -402,6 +697,7 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
       <span class="detail-time">${fmtTime(req.timestamp)}</span>
       <button class="btn btn-sm" id="copyCurl">Copy curl</button>
     </div>
+    ${req.routing_category ? `<div class="routing-meta">Routing: <span class="routing-badge">${esc(req.routing_category)}</span> → ${esc(req.routed_to_url || 'default upstream')}</div>` : ''}
 
     <div class="split-pane">
       <div class="split-col">
@@ -410,7 +706,7 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
           <div class="meta-row"><span class="meta-label">Model</span><span class="meta-val">${esc(model || '-')}</span></div>
           <div class="meta-row"><span class="meta-label">Input tokens</span><span class="meta-val">${req.input_tokens ?? '-'}</span></div>
           ${systemBlock}
-          ${prevMessageCount > 0 ? `<div class="prev-messages-toggle" id="prevMsgToggle">${prevMessageCount} previous messages hidden — click to show</div><div id="prevMsgContainer" class="prev-messages hidden">${messages.slice(0, prevMessageCount).map((m, i) => renderMsgBlock(m, i, fmtTime(msgTimestamps[i]))).join('')}</div>` : ''}
+          ${prevMessageCount > 0 ? `<div class="prev-messages-toggle" id="prevMsgToggle">▶ ${prevMessageCount} previous messages hidden</div><div id="prevMsgContainer" class="prev-messages hidden">${messages.slice(0, prevMessageCount).map((m, i) => renderMsgBlock(m, i, fmtTime(msgTimestamps[i]))).join('')}</div><div class="new-messages-divider">── New in this request ──</div>` : ''}
           ${(prevMessageCount > 0 ? messages.slice(prevMessageCount) : messages).map((m, i) => { const gi = prevMessageCount > 0 ? prevMessageCount + i : i; return renderMsgBlock(m, gi, fmtTime(msgTimestamps[gi])) }).join('') || '<div class="empty-msg" style="padding:12px 0">No messages</div>'}
         </div>
       </div>
@@ -449,8 +745,8 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
       const container = document.getElementById('prevMsgContainer')
       const hidden = container.classList.toggle('hidden')
       prevToggle.textContent = hidden
-        ? `${prevMessageCount} previous messages hidden — click to show`
-        : `${prevMessageCount} previous messages — click to hide`
+        ? `▶ ${prevMessageCount} previous messages hidden`
+        : `▼ ${prevMessageCount} previous messages shown`
     })
   }
 
@@ -548,59 +844,56 @@ async function loadRequests() {
 async function loadDetail(id) {
   const req = await getRequestDetail(id)
 
-  // Build per-message timestamp map by tracing session history.
-  // Each message index gets the timestamp of the request that first introduced it.
   let prevMessageCount = 0
-  const msgTimestamps = [] // msgTimestamps[i] = timestamp string for message i
+  const msgTimestamps = []
 
   let currentMessages = []
   try { currentMessages = JSON.parse(req.request_body).messages || [] } catch {}
   const totalMessages = currentMessages.length
 
   if (req.session_id) {
-    // Collect same-session requests older than (and including) current, sorted oldest→newest
-    const idx = requests.findIndex(r => r.id === id)
-    if (idx >= 0) {
-      const sessionReqs = requests
-        .slice(idx)  // idx and older (list is desc by time)
-        .filter(r => r.session_id === req.session_id)
-        .reverse()   // now oldest first
+    // Fetch all requests for this session directly from API (not relying on filtered requests list)
+    const sessionReqs = await getRequests(req.session_id, { limit: 500 })
 
-      // Walk through each request to find when each message index first appeared
-      let prevCount = 0
-      for (const sr of sessionReqs) {
-        let detail, msgCount
-        if (sr.id === id) {
-          // Current request — no extra fetch needed
-          msgCount = totalMessages
-          detail = req
-        } else {
-          try {
-            detail = await getRequestDetail(sr.id)
-            const body = JSON.parse(detail.request_body)
-            msgCount = (body.messages || []).length
-          } catch { continue }
-        }
-        // Messages from prevCount to msgCount-1 were introduced by this request
-        for (let i = prevCount; i < msgCount; i++) {
-          msgTimestamps[i] = detail.timestamp
-        }
-        prevCount = msgCount
-      }
+    // Sort by timestamp ascending (oldest first)
+    const sorted = [...sessionReqs].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
 
-      // prevMessageCount = messages from the request just before this one
-      const prevReq = requests.slice(idx + 1).find(r => r.session_id === req.session_id)
-      if (prevReq) {
+    // Find the current request's position
+    const curIdx = sorted.findIndex(r => r.id === id)
+
+    // Walk through each request up to current to build timestamp map
+    let prevCount = 0
+    for (let si = 0; si <= curIdx && si < sorted.length; si++) {
+      const sr = sorted[si]
+      let detail, msgCount
+      if (sr.id === id) {
+        msgCount = totalMessages
+        detail = req
+      } else {
         try {
-          const prevDetail = await getRequestDetail(prevReq.id)
-          const prevBody = JSON.parse(prevDetail.request_body)
-          prevMessageCount = (prevBody.messages || []).length
-        } catch {}
+          detail = await getRequestDetail(sr.id)
+          const body = JSON.parse(detail.request_body)
+          msgCount = (body.messages || []).length
+        } catch { continue }
       }
+      for (let i = prevCount; i < msgCount; i++) {
+        msgTimestamps[i] = detail.timestamp
+      }
+      prevCount = msgCount
+    }
+
+    // prevMessageCount = messages from the request just before this one
+    if (curIdx > 0) {
+      const prevReq = sorted[curIdx - 1]
+      try {
+        const prevDetail = await getRequestDetail(prevReq.id)
+        const prevBody = JSON.parse(prevDetail.request_body)
+        prevMessageCount = (prevBody.messages || []).length
+      } catch {}
     }
   }
 
-  // Fill any gaps (e.g. first request in session, or no history)
+  // Fill any gaps
   for (let i = 0; i < totalMessages; i++) {
     if (!msgTimestamps[i]) msgTimestamps[i] = req.timestamp
   }
@@ -615,6 +908,13 @@ async function init() {
     const res = await getInterceptStatus()
     interceptEnabled = res.enabled
     renderInterceptToggle()
+  } catch (_) {}
+
+  // Load routing config and rules
+  try {
+    routingConfig = await getRoutingConfig()
+    routingRules = await getRoutingRules()
+    renderRoutingBtn()
   } catch (_) {}
 
   await loadSessions()
