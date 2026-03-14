@@ -62,6 +62,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             request_id TEXT NOT NULL,
             file_path TEXT NOT NULL,
             access_type TEXT NOT NULL,
+            read_range TEXT NOT NULL DEFAULT '',
             timestamp TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_file_access_session ON file_access(session_id);
@@ -100,6 +101,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE requests ADD COLUMN routed_to_url TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add read_range column to file_access
+    let _ = conn.execute(
+        "ALTER TABLE file_access ADD COLUMN read_range TEXT NOT NULL DEFAULT ''", [],
     );
     // Migration: add description column to routing_rules
     let _ = conn.execute(
@@ -255,6 +260,18 @@ pub fn find_session_id_by_cwd(conn: &Connection, cwd: &str) -> Result<Option<Str
         "SELECT id FROM sessions WHERE cwd = ?1 ORDER BY last_seen_at DESC LIMIT 1"
     )?;
     let mut rows = stmt.query_map(params![cwd], |row| row.get::<_, String>(0))?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Returns the session ID for a given CWD + PID combination.
+/// Only matches sessions with the exact same PID. Different PIDs = different sessions.
+/// Subagents are grouped because they share the same parent PID (lsof resolves to the
+/// parent node process, not the child).
+pub fn find_session_id_by_cwd_and_pid(conn: &Connection, cwd: &str, pid: i64) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM sessions WHERE cwd = ?1 AND pid = ?2 ORDER BY last_seen_at DESC LIMIT 1"
+    )?;
+    let mut rows = stmt.query_map(params![cwd, pid], |row| row.get::<_, String>(0))?;
     Ok(rows.next().transpose()?)
 }
 
@@ -551,6 +568,7 @@ pub struct FileAccessRecord {
     pub request_id: String,
     pub file_path: String,
     pub access_type: String,
+    pub read_range: String,  // e.g. "full", "offset:100,limit:50", ""
     pub timestamp: String,
 }
 
@@ -560,19 +578,20 @@ pub fn insert_file_access(
     request_id: &str,
     file_path: &str,
     access_type: &str,
+    read_range: &str,
     timestamp: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO file_access (session_id, request_id, file_path, access_type, timestamp)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![session_id, request_id, file_path, access_type, timestamp],
+        "INSERT INTO file_access (session_id, request_id, file_path, access_type, read_range, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![session_id, request_id, file_path, access_type, read_range, timestamp],
     )?;
     Ok(())
 }
 
 pub fn get_file_access_by_session(conn: &Connection, session_id: &str) -> Result<Vec<FileAccessRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, request_id, file_path, access_type, timestamp
+        "SELECT session_id, request_id, file_path, access_type, read_range, timestamp
          FROM file_access WHERE session_id = ?1
          ORDER BY timestamp ASC"
     )?;
@@ -582,7 +601,8 @@ pub fn get_file_access_by_session(conn: &Connection, session_id: &str) -> Result
             request_id: row.get(1)?,
             file_path: row.get(2)?,
             access_type: row.get(3)?,
-            timestamp: row.get(4)?,
+            read_range: row.get::<_, String>(4).unwrap_or_default(),
+            timestamp: row.get(5)?,
         })
     })?
     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1163,9 +1183,9 @@ mod tests {
     #[test]
     fn file_access_insert_and_query() {
         let conn = setup();
-        insert_file_access(&conn, "s1", "r1", "/src/main.rs", "read", "2024-01-01T00:00:00Z").unwrap();
-        insert_file_access(&conn, "s1", "r1", "/src/db.rs", "edit", "2024-01-01T00:01:00Z").unwrap();
-        insert_file_access(&conn, "s2", "r2", "/other.rs", "read", "2024-01-01T00:02:00Z").unwrap();
+        insert_file_access(&conn, "s1", "r1", "/src/main.rs", "read", "full", "2024-01-01T00:00:00Z").unwrap();
+        insert_file_access(&conn, "s1", "r1", "/src/db.rs", "edit", "", "2024-01-01T00:01:00Z").unwrap();
+        insert_file_access(&conn, "s2", "r2", "/other.rs", "read", "offset:10,limit:50", "2024-01-01T00:02:00Z").unwrap();
 
         let accesses = get_file_access_by_session(&conn, "s1").unwrap();
         assert_eq!(accesses.len(), 2);
@@ -1202,7 +1222,7 @@ mod tests {
         let conn = setup();
         upsert_session(&conn, &sample_session("s1")).unwrap();
         insert_request(&conn, &sample_request("r1", "s1")).unwrap();
-        insert_file_access(&conn, "s1", "r1", "/src/main.rs", "read", "2024-01-01T00:00:00Z").unwrap();
+        insert_file_access(&conn, "s1", "r1", "/src/main.rs", "read", "full", "2024-01-01T00:00:00Z").unwrap();
         set_supervisor_cache(&conn, "s1", "summary", 1, 0, "{}").unwrap();
 
         delete_session(&conn, "s1").unwrap();

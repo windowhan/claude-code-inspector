@@ -22,7 +22,7 @@ Claude Code ──HTTP──▶ Proxy :7878 ──HTTPS──▶ api.anthropic.c
 |---|---------|--------|
 | 1 | **Request interceptor & editor** — Intercept a request mid-flight, modify the payload (model, messages, parameters), then forward the edited request to the upstream API | ✅ Done |
 | 2 | **Multi-provider routing** — Route specific requests to a different LLM provider (OpenAI, Gemini, Mistral, etc.) based on rules such as model name, session, or request content | 🔲 Planned |
-| 3 | **Supervisor agent** — A separate management agent that continuously reads the recorded request/response history and evaluates whether the ongoing session is heading in the right direction, flags missing steps, detects loops or regressions, and surfaces actionable feedback in real time | 🔲 Planned |
+| 3 | **Supervisor agent** — MCP tools + dashboard UI for monitoring sessions: file coverage tracking, loop/error/stall pattern detection, session summaries. Use from another Claude Code session to supervise ongoing work | ✅ Done |
 
 ---
 
@@ -209,6 +209,9 @@ Available MCP tools after registration:
 | `list_sessions` | List tracked sessions (request count, token totals) |
 | `list_requests` | List requests (filter by session_id, pagination) |
 | `get_request` | Full detail for a specific request (messages, response, usage, timing) |
+| `get_session_summary` | Structured session flow: per-request details, tool usage, token breakdown, errors |
+| `get_file_coverage` | File access coverage: which files were read/written/edited/searched, with read range tracking |
+| `detect_patterns` | Detect problematic patterns: loops, error repetition, regressions, stalls |
 
 ---
 

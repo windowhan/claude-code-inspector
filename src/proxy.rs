@@ -66,11 +66,16 @@ async fn handle_inner(
     // Identify session
     let session_info = resolve_session(peer_addr, &session_cache).await;
 
-    // If we know the CWD, try to reuse an existing session for that directory.
-    // This groups subagents/background tasks running from the same project under one session.
+    // If we know the CWD and PID, try to reuse an existing session.
+    // Groups subagents (same CWD, recent timeframe) but keeps separate Claude Code instances apart.
     let session_id = {
         let db = state.db.lock().await;
-        if let Some(cwd) = &session_info.cwd {
+        if let (Some(cwd), Some(pid)) = (&session_info.cwd, session_info.pid) {
+            db::find_session_id_by_cwd_and_pid(&db, cwd, pid)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| session_info.session_id.clone())
+        } else if let Some(cwd) = &session_info.cwd {
             db::find_session_id_by_cwd(&db, cwd)
                 .ok()
                 .flatten()
@@ -426,8 +431,8 @@ async fn handle_inner(
                     // Extract and store file accesses
                     {
                         let accesses = supervisor::extract_file_accesses(&body_str_clone);
-                        for (path, atype) in &accesses {
-                            let _ = db::insert_file_access(&db, &session_id_clone, &request_id_clone, path, atype, &timestamp_clone);
+                        for (path, atype, range) in &accesses {
+                            let _ = db::insert_file_access(&db, &session_id_clone, &request_id_clone, path, atype, range, &timestamp_clone);
                         }
                     }
 
@@ -508,8 +513,8 @@ async fn handle_inner(
             // Extract and store file accesses
             {
                 let accesses = supervisor::extract_file_accesses(&body_str);
-                for (path, atype) in &accesses {
-                    let _ = db::insert_file_access(&db, &session_id, &request_id, path, atype, &timestamp);
+                for (path, atype, range) in &accesses {
+                    let _ = db::insert_file_access(&db, &session_id, &request_id, path, atype, range, &timestamp);
                 }
             }
         }

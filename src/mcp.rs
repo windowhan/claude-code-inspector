@@ -294,6 +294,8 @@ async fn handle_file_coverage(state: &AppState, params: Option<&Value>) -> Value
                     "file_path": fa.file_path,
                     "access_types": [],
                     "access_count": 0,
+                    "has_full_read": false,
+                    "read_ranges": [],
                     "first_accessed": fa.timestamp.clone(),
                     "last_accessed": fa.timestamp.clone(),
                 }));
@@ -303,6 +305,24 @@ async fn handle_file_coverage(state: &AppState, params: Option<&Value>) -> Value
                     let atype = json!(fa.access_type);
                     if !types.contains(&atype) {
                         types.push(atype);
+                    }
+                }
+                if fa.access_type == "read" {
+                    let is_default_read = fa.read_range == "full" || fa.read_range.is_empty();
+                    if is_default_read {
+                        if let Some(ranges) = entry["read_ranges"].as_array_mut() {
+                            let r = json!("default");
+                            if !ranges.contains(&r) {
+                                ranges.push(r);
+                            }
+                        }
+                    } else if !fa.read_range.is_empty() {
+                        if let Some(ranges) = entry["read_ranges"].as_array_mut() {
+                            let r = json!(fa.read_range);
+                            if !ranges.contains(&r) {
+                                ranges.push(r);
+                            }
+                        }
                     }
                 }
             }
@@ -681,8 +701,8 @@ mod tests {
         // Insert file access records
         {
             let db = state.db.try_lock().unwrap();
-            db::insert_file_access(&db, &sid, "req-1", "/src/main.rs", "read", "2024-01-01T00:00:00Z").unwrap();
-            db::insert_file_access(&db, &sid, "req-1", "/src/db.rs", "edit", "2024-01-01T00:01:00Z").unwrap();
+            db::insert_file_access(&db, &sid, "req-1", "/src/main.rs", "read", "full", "2024-01-01T00:00:00Z").unwrap();
+            db::insert_file_access(&db, &sid, "req-1", "/src/db.rs", "edit", "", "2024-01-01T00:01:00Z").unwrap();
         }
 
         let params = json!({"name": "get_file_coverage", "arguments": {"session_id": sid}});

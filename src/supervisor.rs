@@ -13,7 +13,9 @@ use crate::types::RequestRecord;
 /// Only parses tool_use blocks (role=assistant) with names: Read, Write, Edit, Grep, Glob.
 /// Does NOT parse tool_result blocks or response_body (v1 limitation).
 /// Does NOT track Bash tool file access (shell commands are opaque).
-pub fn extract_file_accesses(request_body: &str) -> Vec<(String, String)> {
+/// Each access: (file_path, access_type, read_range)
+/// read_range is "full" for full reads, "offset:N,limit:M" for partial, "" for non-read ops
+pub fn extract_file_accesses(request_body: &str) -> Vec<(String, String, String)> {
     let mut accesses = Vec::new();
 
     let body: Value = match serde_json::from_str(request_body) {
@@ -72,9 +74,23 @@ pub fn extract_file_accesses(request_body: &str) -> Vec<(String, String)> {
                 .or_else(|| input.get("path"))
                 .and_then(|p| p.as_str());
 
+            // For Read: extract offset/limit to determine if full or partial read
+            let read_range = if access_type == "read" {
+                let offset = input.get("offset").and_then(|v| v.as_i64());
+                let limit = input.get("limit").and_then(|v| v.as_i64());
+                match (offset, limit) {
+                    (None, None) => "full".to_string(),
+                    (Some(o), Some(l)) => format!("offset:{o},limit:{l}"),
+                    (Some(o), None) => format!("offset:{o}"),
+                    (None, Some(l)) => format!("limit:{l}"),
+                }
+            } else {
+                String::new()
+            };
+
             if let Some(path) = file_path {
                 if !path.is_empty() {
-                    accesses.push((path.to_string(), access_type.to_string()));
+                    accesses.push((path.to_string(), access_type.to_string(), read_range));
                 }
             }
         }
@@ -86,13 +102,19 @@ pub fn extract_file_accesses(request_body: &str) -> Vec<(String, String)> {
 // ── Session summary ──────────────────────────────────────────────────────────
 
 /// Build a structured summary of a session's request flow.
+/// Excludes non-message requests like count_tokens.
 pub fn build_session_summary(requests: &[RequestRecord]) -> Value {
     let mut total_input: i64 = 0;
     let mut total_output: i64 = 0;
     let mut error_count: i64 = 0;
     let mut error_details: Vec<Value> = Vec::new();
 
-    let req_summaries: Vec<Value> = requests
+    let filtered: Vec<&RequestRecord> = requests
+        .iter()
+        .filter(|r| !r.path.contains("count_tokens"))
+        .collect();
+
+    let req_summaries: Vec<Value> = filtered
         .iter()
         .map(|r| {
             total_input += r.input_tokens.unwrap_or(0);
@@ -132,7 +154,8 @@ pub fn build_session_summary(requests: &[RequestRecord]) -> Value {
         .collect();
 
     json!({
-        "request_count": requests.len(),
+        "request_count": filtered.len(),
+        "excluded_count": requests.len() - filtered.len(),
         "total_input_tokens": total_input,
         "total_output_tokens": total_output,
         "total_tokens": total_input + total_output,
@@ -375,6 +398,7 @@ mod tests {
             request_id: request_id.to_string(),
             file_path: path.to_string(),
             access_type: atype.to_string(),
+            read_range: String::new(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
         }
     }
@@ -387,7 +411,7 @@ mod tests {
             ]}
         ]}"#;
         let result = extract_file_accesses(body);
-        assert_eq!(result, vec![("/src/main.rs".to_string(), "read".to_string())]);
+        assert_eq!(result, vec![("/src/main.rs".to_string(), "read".to_string(), "full".to_string())]);
     }
 
     #[test]
@@ -400,8 +424,8 @@ mod tests {
         ]}"#;
         let result = extract_file_accesses(body);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0], ("/src/new.rs".to_string(), "write".to_string()));
-        assert_eq!(result[1], ("/src/db.rs".to_string(), "edit".to_string()));
+        assert_eq!(result[0], ("/src/new.rs".to_string(), "write".to_string(), String::new()));
+        assert_eq!(result[1], ("/src/db.rs".to_string(), "edit".to_string(), String::new()));
     }
 
     #[test]
@@ -415,6 +439,7 @@ mod tests {
         let result = extract_file_accesses(body);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].1, "search");
+        assert_eq!(result[0].2, "");
         assert_eq!(result[1].1, "search");
     }
 

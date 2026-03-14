@@ -139,6 +139,23 @@ export async function testRoutingClassifier(prompt, system = '') {
   return r.json()
 }
 
+// ── Supervisor API ───────────────────────────────────────────────────────────
+
+export async function getSessionSummary(sessionId) {
+  const r = await fetch(`${BASE}/api/supervisor/summary/${sessionId}`)
+  return r.json()
+}
+
+export async function getFileCoverage(sessionId) {
+  const r = await fetch(`${BASE}/api/supervisor/coverage/${sessionId}`)
+  return r.json()
+}
+
+export async function getDetectPatterns(sessionId) {
+  const r = await fetch(`${BASE}/api/supervisor/patterns/${sessionId}`)
+  return r.json()
+}
+
 /** Connect to SSE stream and call cb on each event */
 export function connectEvents(cb) {
   let es
