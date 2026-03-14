@@ -17,6 +17,7 @@ use crate::intercept;
 use crate::routing;
 use crate::session::{resolve_session, SessionCache};
 use crate::sse_tee::{parse_sse_content, SseTeeStream};
+use crate::supervisor;
 use crate::types::{AppState, DashboardEvent, InterceptAction, RequestRecord, SessionRecord};
 
 pub async fn handle_request(
@@ -391,6 +392,8 @@ async fn handle_inner(
         let state_clone = Arc::clone(&state);
         let request_id_clone = request_id.clone();
         let session_id_clone = session_id.clone();
+        let body_str_clone = body_str.clone();
+        let timestamp_clone = timestamp.clone();
         let project_name = session_info.project_name.clone();
         let resp_headers_json = serde_json::to_string(&resp_log_headers).unwrap_or_default();
         let status_code = status.as_u16() as i64;
@@ -420,6 +423,14 @@ async fn handle_inner(
                     ) {
                         warn!("Failed to update SSE request: {e}");
                     }
+                    // Extract and store file accesses
+                    {
+                        let accesses = supervisor::extract_file_accesses(&body_str_clone);
+                        for (path, atype) in &accesses {
+                            let _ = db::insert_file_access(&db, &session_id_clone, &request_id_clone, path, atype, &timestamp_clone);
+                        }
+                    }
+
                     drop(db);
 
                     emit_event(&state_clone, "request_update", serde_json::json!({
@@ -492,6 +503,14 @@ async fn handle_inner(
                 status_str,
             ) {
                 warn!("Failed to update request: {e}");
+            }
+
+            // Extract and store file accesses
+            {
+                let accesses = supervisor::extract_file_accesses(&body_str);
+                for (path, atype) in &accesses {
+                    let _ = db::insert_file_access(&db, &session_id, &request_id, path, atype, &timestamp);
+                }
             }
         }
 
