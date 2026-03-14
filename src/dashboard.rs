@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::db;
 use crate::intercept;
 use crate::routing;
+use crate::supervisor;
 use crate::types::{AppState, InterceptAction, RoutingConfig, RoutingRule};
 
 // A boxed body type that can be either Full<Bytes> or a streaming body
@@ -97,6 +98,19 @@ pub async fn handle_dashboard(
         }
         ("POST", "/api/routing/reorder") => full_to_box(serve_routing_reorder(&state, request_body.as_deref().unwrap_or(&[])).await),
         ("POST", "/api/routing/test") => full_to_box(serve_routing_test(&state, request_body.as_deref().unwrap_or(&[])).await),
+        // Supervisor API
+        ("GET", p) if p.starts_with("/api/supervisor/summary/") => {
+            let sid = p.trim_start_matches("/api/supervisor/summary/");
+            full_to_box(serve_supervisor_summary(&state, sid).await)
+        }
+        ("GET", p) if p.starts_with("/api/supervisor/coverage/") => {
+            let sid = p.trim_start_matches("/api/supervisor/coverage/");
+            full_to_box(serve_supervisor_coverage(&state, sid).await)
+        }
+        ("GET", p) if p.starts_with("/api/supervisor/patterns/") => {
+            let sid = p.trim_start_matches("/api/supervisor/patterns/");
+            full_to_box(serve_supervisor_patterns(&state, sid).await)
+        }
         ("GET", "/events") => serve_sse_stream(&state),
         ("GET", _) => full_to_box(serve_static(&path)),
         _ => full_to_box(Response::builder().status(StatusCode::METHOD_NOT_ALLOWED)
@@ -475,6 +489,181 @@ async fn serve_routing_test(state: &AppState, body: &[u8]) -> Response<Full<Byte
     let rules = state.routing_rules.read().await;
     let category = routing::classify_intent(&config, "", &request_body, &rules).await;
     json_response(serde_json::json!({"category": category}))
+}
+
+// ── Supervisor API handlers ──────────────────────────────────────────────────
+
+fn get_session_counts(stats: &[serde_json::Value], session_id: &str) -> (i64, i64) {
+    for s in stats {
+        if s.get("id").and_then(|v| v.as_str()) == Some(session_id) {
+            let rc = s.get("request_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            let pc = s.get("pending_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            return (rc, pc);
+        }
+    }
+    (0, 0)
+}
+
+async fn serve_supervisor_summary(state: &AppState, session_id: &str) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    let stats = db::get_session_stats(&db).unwrap_or_default();
+    let (req_count, pending_count) = get_session_counts(&stats, session_id);
+
+    if let Ok(Some(cached)) = db::get_supervisor_cache(&db, session_id, "get_session_summary", req_count, pending_count) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cached) {
+            return json_response(val);
+        }
+    }
+
+    match db::get_requests(&db, Some(session_id), 10000, 0) {
+        Ok(reqs) => {
+            let summary = supervisor::build_session_summary(&reqs);
+            let text = serde_json::to_string(&summary).unwrap_or_default();
+            let _ = db::set_supervisor_cache(&db, session_id, "get_session_summary", req_count, pending_count, &text);
+            json_response(summary)
+        }
+        Err(e) => json_error(&e.to_string()),
+    }
+}
+
+async fn serve_supervisor_coverage(state: &AppState, session_id: &str) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    let stats = db::get_session_stats(&db).unwrap_or_default();
+    let (req_count, pending_count) = get_session_counts(&stats, session_id);
+
+    if let Ok(Some(cached)) = db::get_supervisor_cache(&db, session_id, "get_file_coverage", req_count, pending_count) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cached) {
+            return json_response(val);
+        }
+    }
+
+    match db::get_file_access_by_session(&db, session_id) {
+        Ok(accesses) => {
+            let mut file_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+            for fa in &accesses {
+                let entry = file_map.entry(fa.file_path.clone()).or_insert_with(|| serde_json::json!({
+                    "file_path": fa.file_path,
+                    "access_types": [],
+                    "access_count": 0,
+                    "has_full_read": false,
+                    "read_ranges": [],
+                    "first_accessed": fa.timestamp.clone(),
+                    "last_accessed": fa.timestamp.clone(),
+                }));
+                entry["access_count"] = serde_json::json!(entry["access_count"].as_i64().unwrap_or(0) + 1);
+                entry["last_accessed"] = serde_json::json!(fa.timestamp);
+                if let Some(types) = entry["access_types"].as_array_mut() {
+                    let atype = serde_json::json!(fa.access_type);
+                    if !types.contains(&atype) {
+                        types.push(atype);
+                    }
+                }
+                if fa.access_type == "read" {
+                    // "full" or empty = no offset/limit specified (default: reads up to 2000 lines)
+                    let is_default_read = fa.read_range == "full" || fa.read_range.is_empty();
+                    if is_default_read {
+                        // Mark as "default" — actual full/partial determined later using total_lines
+                        if let Some(ranges) = entry["read_ranges"].as_array_mut() {
+                            let r = serde_json::json!("default");
+                            if !ranges.contains(&r) {
+                                ranges.push(r);
+                            }
+                        }
+                    } else if !fa.read_range.is_empty() {
+                        if let Some(ranges) = entry["read_ranges"].as_array_mut() {
+                            let r = serde_json::json!(fa.read_range);
+                            if !ranges.contains(&r) {
+                                ranges.push(r);
+                            }
+                        }
+                    }
+                }
+            }
+            // Enrich each file with total_lines from disk and lines_read calculation
+            const DEFAULT_READ_LIMIT: i64 = 2000;
+            let mut files: Vec<serde_json::Value> = file_map.into_values().collect();
+            for f in &mut files {
+                let path = f["file_path"].as_str().unwrap_or("");
+                // Count total lines from disk
+                let total_lines = std::fs::read_to_string(path)
+                    .map(|c| c.lines().count() as i64)
+                    .unwrap_or(-1);  // -1 = file not found or unreadable
+                f["total_lines"] = serde_json::json!(total_lines);
+
+                // Calculate lines_read and has_full_read from read_ranges + total_lines
+                let mut lines_read: i64 = 0;
+                let mut is_full = false;
+
+                if let Some(ranges) = f["read_ranges"].as_array() {
+                    for r in ranges {
+                        if let Some(s) = r.as_str() {
+                            if s == "default" {
+                                // No offset/limit = reads up to DEFAULT_READ_LIMIT lines
+                                if total_lines > 0 && total_lines <= DEFAULT_READ_LIMIT {
+                                    // File fits within default limit → truly full read
+                                    lines_read = total_lines;
+                                    is_full = true;
+                                } else if total_lines > DEFAULT_READ_LIMIT {
+                                    // File exceeds default limit → partial
+                                    lines_read = DEFAULT_READ_LIMIT;
+                                } else {
+                                    // File not found on disk, assume default limit
+                                    lines_read = DEFAULT_READ_LIMIT;
+                                }
+                            } else {
+                                // Parse "offset:N,limit:M" or "limit:M"
+                                let mut limit_val: i64 = 0;
+                                for part in s.split(',') {
+                                    if let Some(v) = part.strip_prefix("limit:") {
+                                        limit_val = v.parse().unwrap_or(0);
+                                    }
+                                }
+                                lines_read += limit_val;
+                            }
+                        }
+                    }
+                }
+
+                // Cap lines_read to total_lines
+                if total_lines > 0 && lines_read >= total_lines {
+                    lines_read = total_lines;
+                    is_full = true;
+                }
+
+                f["has_full_read"] = serde_json::json!(is_full);
+                f["lines_read"] = serde_json::json!(lines_read);
+            }
+            let result = serde_json::json!({
+                "file_count": files.len(),
+                "total_accesses": accesses.len(),
+                "files": files,
+            });
+            let text = serde_json::to_string(&result).unwrap_or_default();
+            let _ = db::set_supervisor_cache(&db, session_id, "get_file_coverage", req_count, pending_count, &text);
+            json_response(result)
+        }
+        Err(e) => json_error(&e.to_string()),
+    }
+}
+
+async fn serve_supervisor_patterns(state: &AppState, session_id: &str) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    let stats = db::get_session_stats(&db).unwrap_or_default();
+    let (req_count, pending_count) = get_session_counts(&stats, session_id);
+
+    if let Ok(Some(cached)) = db::get_supervisor_cache(&db, session_id, "detect_patterns", req_count, pending_count) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&cached) {
+            return json_response(val);
+        }
+    }
+
+    let reqs = db::get_requests(&db, Some(session_id), 10000, 0).unwrap_or_default();
+    let accesses = db::get_file_access_by_session(&db, session_id).unwrap_or_default();
+    let patterns = supervisor::detect_patterns(&reqs, &accesses);
+    let result = supervisor::patterns_to_json(&patterns);
+    let text = serde_json::to_string(&result).unwrap_or_default();
+    let _ = db::set_supervisor_cache(&db, session_id, "detect_patterns", req_count, pending_count, &text);
+    json_response(result)
 }
 
 fn url_decode(s: &str) -> String {

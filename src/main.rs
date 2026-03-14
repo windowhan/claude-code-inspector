@@ -6,6 +6,7 @@ mod proxy;
 mod routing;
 mod session;
 mod sse_tee;
+mod supervisor;
 mod types;
 
 use std::net::SocketAddr;

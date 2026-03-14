@@ -1,4 +1,4 @@
-import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest, getRoutingConfig, saveRoutingConfig, getRoutingRules, createRoutingRule, updateRoutingRule, deleteRoutingRule, reorderRoutingRules, testRoutingClassifier } from './api.js'
+import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest, getRoutingConfig, saveRoutingConfig, getRoutingRules, createRoutingRule, updateRoutingRule, deleteRoutingRule, reorderRoutingRules, testRoutingClassifier, getSessionSummary, getFileCoverage, getDetectPatterns } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -13,6 +13,12 @@ let routingPanelOpen = false
 let routingConfig = null
 let routingRules = []
 let editingRuleId = null          // null = not editing, 'new' = adding new
+let supervisorSessionId = null    // session ID being supervised (null = not showing)
+let supervisorRefreshTimer = null
+const debouncedSupervisorRefresh = (sid) => {
+  clearTimeout(supervisorRefreshTimer)
+  supervisorRefreshTimer = setTimeout(() => renderSupervisorPanel(sid), 2000)
+}
 
 // ── DOM ───────────────────────────────────────────────────────────────────────
 document.querySelector('#app').innerHTML = `
@@ -25,6 +31,9 @@ document.querySelector('#app').innerHTML = `
   </button>
   <button class="routing-btn" id="routingBtn" title="Configure multi-provider routing">
     <span id="routingLabel">⇄ Routes</span>
+  </button>
+  <button class="supervisor-btn" id="supervisorBtn" title="Supervisor analysis for selected session">
+    <span id="supervisorLabel">Supervisor</span>
   </button>
   <span class="header-meta" id="hMeta">Loading…</span>
 </header>
@@ -53,6 +62,8 @@ const $interceptDot    = document.getElementById('interceptDot')
 const $interceptLabel  = document.getElementById('interceptLabel')
 const $routingBtn      = document.getElementById('routingBtn')
 const $routingLabel    = document.getElementById('routingLabel')
+const $supervisorBtn   = document.getElementById('supervisorBtn')
+const $supervisorLabel = document.getElementById('supervisorLabel')
 const $hMeta       = document.getElementById('hMeta')
 const $sessionList = document.getElementById('sessionList')
 const $reqCount    = document.getElementById('reqCount')
@@ -125,6 +136,19 @@ $routingBtn.addEventListener('click', () => {
       $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
     }
   }
+})
+
+$supervisorBtn.addEventListener('click', () => {
+  // Use selected session, or first session if none selected
+  const sid = selectedSession && selectedSession !== '__starred__'
+    ? selectedSession
+    : sessions.length > 0 ? sessions[0].id : null
+  if (!sid) {
+    $detail.innerHTML = '<div class="detail-empty">No session to analyze</div>'
+    return
+  }
+  routingPanelOpen = false
+  renderSupervisorPanel(sid)
 })
 
 function renderRoutingPanel() {
@@ -416,6 +440,7 @@ function renderSessions() {
         ${esc(s.project_name || 'unknown')}
         <button class="session-del-btn" data-del-sid="${s.id}" title="Delete session">✕</button>
       </div>
+      <div class="session-id" title="${s.id}">${s.id.slice(0, 8)}</div>
       <div class="session-cwd">${esc(s.cwd || '')}</div>
       <div class="session-stats">${s.request_count} req${tokS}</div>
     </div>`
@@ -433,6 +458,10 @@ function renderSessions() {
       if (selectedSession === '') selectedSession = null
       renderSessions()
       loadRequests()
+      // Update supervisor panel if open
+      if (supervisorSessionId && selectedSession && selectedSession !== '__starred__') {
+        renderSupervisorPanel(selectedSession)
+      }
     })
   })
 
@@ -448,6 +477,7 @@ function renderSessions() {
       await loadRequests()
     })
   })
+
 }
 
 function renderRequests() {
@@ -827,6 +857,135 @@ function renderDetail(req, prevMessageCount = 0, msgTimestamps = []) {
 }
 
 // ── Data loading ──────────────────────────────────────────────────────────────
+// ── Supervisor Panel ──────────────────────────────────────────────────────────
+
+async function renderSupervisorPanel(sessionId) {
+  supervisorSessionId = sessionId
+  $detail.innerHTML = '<div class="detail-empty">Loading supervisor analysis…</div>'
+
+  const [summary, coverage, patterns] = await Promise.all([
+    getSessionSummary(sessionId),
+    getFileCoverage(sessionId),
+    getDetectPatterns(sessionId),
+  ])
+
+  // Patterns section
+  const patternsHtml = (patterns.patterns || []).length === 0
+    ? '<div class="empty-msg" style="padding:8px 0">No problematic patterns detected</div>'
+    : (patterns.patterns || []).map(p => `
+        <div class="sv-pattern sv-${p.severity}">
+          <span class="sv-severity">${p.severity}</span>
+          <span class="sv-type">${esc(p.type)}</span>
+          ${esc(p.description)}
+        </div>`).join('')
+
+  // Coverage section with stats
+  const files = (coverage.files || []).sort((a, b) => (b.access_count || 0) - (a.access_count || 0))
+  const readFiles = files.filter(f => (f.access_types||[]).includes('read'))
+  const fullReadFiles = files.filter(f => f.has_full_read)
+  const partialOnlyFiles = readFiles.filter(f => !f.has_full_read)
+  const writeFiles = files.filter(f => (f.access_types||[]).includes('write') || (f.access_types||[]).includes('edit'))
+  const searchFiles = files.filter(f => (f.access_types||[]).includes('search'))
+  const notReadFiles = files.filter(f => !(f.access_types||[]).includes('read'))
+
+  const formatRange = (ranges) => {
+    if (!ranges || ranges.length === 0) return ''
+    return ranges.map(r => {
+      if (r === 'full') return 'full'
+      // Parse "offset:N,limit:M" into "lines N–N+M"
+      const parts = {}
+      r.split(',').forEach(p => { const [k,v] = p.split(':'); parts[k] = parseInt(v) })
+      const start = (parts.offset || 0) + 1
+      const end = parts.limit ? start + parts.limit - 1 : '?'
+      return `L${start}–${end}`
+    }).join(', ')
+  }
+
+  const statsHtml = files.length === 0 ? '' : `
+    <div class="sv-stats-bar">
+      <span class="sv-stat sv-stat-good">${fullReadFiles.length} full read</span>
+      <span class="sv-stat sv-stat-warn">${partialOnlyFiles.length} partial</span>
+      <span class="sv-stat">${writeFiles.length} written</span>
+      <span class="sv-stat">${searchFiles.length} searched</span>
+      ${notReadFiles.length > 0 ? `<span class="sv-stat sv-stat-bad">${notReadFiles.length} not read</span>` : ''}
+    </div>`
+
+  const coverageHtml = files.length === 0
+    ? '<div class="empty-msg" style="padding:8px 0">No file access recorded</div>'
+    : `${statsHtml}
+      <table class="sv-table">
+        <tr><th>File</th><th>Type</th><th>Read Coverage</th><th>Count</th></tr>
+        ${files.map(f => {
+          const ranges = f.read_ranges || []
+          const hasRead = (f.access_types||[]).includes('read')
+          const totalLines = f.total_lines > 0 ? f.total_lines : null
+          const linesRead = f.lines_read || 0
+          let readStatus = '-'
+          if (f.has_full_read) {
+            readStatus = `<span class="sv-full-read">full${totalLines ? ` (${totalLines}/${totalLines})` : ''}</span>`
+          } else if (ranges.length > 0) {
+            const pct = totalLines ? ` ${Math.round(linesRead / totalLines * 100)}%` : ''
+            readStatus = `<span class="sv-partial-read">${formatRange(ranges)} (${linesRead}/${totalLines || '?'})${pct}</span>`
+          } else if (hasRead) {
+            readStatus = '<span class="sv-partial-read">partial</span>'
+          }
+          return `<tr>
+          <td class="sv-filepath">${esc(f.file_path)}</td>
+          <td>${(f.access_types || []).map(t => `<span class="sv-access-${t}">${t}</span>`).join(' ')}</td>
+          <td>${readStatus}</td>
+          <td>${f.access_count}</td>
+        </tr>`}).join('')}
+      </table>`
+
+  // Summary section
+  const reqList = (summary.requests || []).map(r => `
+    <tr>
+      <td>${esc(r.request_id?.slice(0, 8) || '')}</td>
+      <td><span class="sv-agent">${esc(r.agent_type || '')}</span></td>
+      <td>${esc(r.status || '')}</td>
+      <td>${r.input_tokens ?? '-'}/${r.output_tokens ?? '-'}</td>
+      <td>${r.duration_ms ? r.duration_ms + 'ms' : '-'}</td>
+    </tr>`).join('')
+
+  $detail.innerHTML = `
+    <div class="sv-panel">
+      <div class="sv-header">
+        <span>Supervisor Analysis</span>
+        <span class="sv-session-id" title="${sessionId}">${sessionId.slice(0, 12)}…</span>
+        <button class="btn btn-sm" id="svClose">Close</button>
+      </div>
+
+      <div class="sv-section">
+        <h3>Patterns (${patterns.pattern_count || 0})</h3>
+        ${patternsHtml}
+      </div>
+
+      <div class="sv-section">
+        <h3>File Coverage (${coverage.file_count || 0} files, ${coverage.total_accesses || 0} accesses)</h3>
+        ${coverageHtml}
+      </div>
+
+      <div class="sv-section">
+        <h3>Request Summary (${summary.request_count || 0} requests, ${summary.total_tokens || 0} tokens)</h3>
+        ${summary.error_count > 0 ? `<div class="sv-pattern sv-error">${summary.error_count} errors detected</div>` : ''}
+        <table class="sv-table">
+          <tr><th>ID</th><th>Agent</th><th>Status</th><th>In/Out</th><th>Duration</th></tr>
+          ${reqList || '<tr><td colspan="5">No requests</td></tr>'}
+        </table>
+      </div>
+    </div>
+  `
+
+  document.getElementById('svClose').addEventListener('click', () => {
+    supervisorSessionId = null
+    if (selectedRequest) {
+      loadDetail(selectedRequest)
+    } else {
+      $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
+    }
+  })
+}
+
 async function loadSessions() {
   sessions = await getSessions()
   renderSessions()
@@ -936,6 +1095,10 @@ async function init() {
     // Only reload detail if the event is about the selected request
     if (selectedRequest && eventRequestId === selectedRequest) {
       loadDetail(selectedRequest)
+    }
+    // Auto-refresh supervisor panel if open (debounced to avoid flicker)
+    if (supervisorSessionId) {
+      debouncedSupervisorRefresh(supervisorSessionId)
     }
   })
 }

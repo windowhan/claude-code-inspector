@@ -55,6 +55,29 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
+
+        CREATE TABLE IF NOT EXISTS file_access (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            access_type TEXT NOT NULL,
+            read_range TEXT NOT NULL DEFAULT '',
+            timestamp TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_access_session ON file_access(session_id);
+        CREATE INDEX IF NOT EXISTS idx_file_access_request ON file_access(request_id);
+        CREATE INDEX IF NOT EXISTS idx_file_access_path ON file_access(file_path);
+
+        CREATE TABLE IF NOT EXISTS supervisor_cache (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            request_count INTEGER NOT NULL,
+            pending_count INTEGER NOT NULL,
+            result TEXT NOT NULL,
+            cached_at TEXT NOT NULL
+        );
     ")?;
     // Migration: add starred column if not yet present (safe to run on existing DBs)
     let _ = conn.execute(
@@ -78,6 +101,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE requests ADD COLUMN routed_to_url TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add read_range column to file_access
+    let _ = conn.execute(
+        "ALTER TABLE file_access ADD COLUMN read_range TEXT NOT NULL DEFAULT ''", [],
     );
     // Migration: add description column to routing_rules
     let _ = conn.execute(
@@ -193,8 +220,10 @@ pub fn update_request_body(conn: &Connection, id: &str, body: &str) -> Result<()
     Ok(())
 }
 
-/// Delete a session and all its requests.
+/// Delete a session and all its requests, file access records, and cached analyses.
 pub fn delete_session(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM file_access WHERE session_id = ?1", params![id])?;
+    conn.execute("DELETE FROM supervisor_cache WHERE session_id = ?1", params![id])?;
     conn.execute("DELETE FROM requests WHERE session_id = ?1", params![id])?;
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
     Ok(())
@@ -231,6 +260,18 @@ pub fn find_session_id_by_cwd(conn: &Connection, cwd: &str) -> Result<Option<Str
         "SELECT id FROM sessions WHERE cwd = ?1 ORDER BY last_seen_at DESC LIMIT 1"
     )?;
     let mut rows = stmt.query_map(params![cwd], |row| row.get::<_, String>(0))?;
+    Ok(rows.next().transpose()?)
+}
+
+/// Returns the session ID for a given CWD + PID combination.
+/// Only matches sessions with the exact same PID. Different PIDs = different sessions.
+/// Subagents are grouped because they share the same parent PID (lsof resolves to the
+/// parent node process, not the child).
+pub fn find_session_id_by_cwd_and_pid(conn: &Connection, cwd: &str, pid: i64) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM sessions WHERE cwd = ?1 AND pid = ?2 ORDER BY last_seen_at DESC LIMIT 1"
+    )?;
+    let mut rows = stmt.query_map(params![cwd, pid], |row| row.get::<_, String>(0))?;
     Ok(rows.next().transpose()?)
 }
 
@@ -515,6 +556,93 @@ pub fn reorder_routing_rules(conn: &Connection, ids: &[String]) -> Result<()> {
             params![(i + 1) as i64, id],
         )?;
     }
+    Ok(())
+}
+
+// ── Supervisor (file access + cache) ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FileAccessRecord {
+    pub session_id: String,
+    pub request_id: String,
+    pub file_path: String,
+    pub access_type: String,
+    pub read_range: String,  // e.g. "full", "offset:100,limit:50", ""
+    pub timestamp: String,
+}
+
+pub fn insert_file_access(
+    conn: &Connection,
+    session_id: &str,
+    request_id: &str,
+    file_path: &str,
+    access_type: &str,
+    read_range: &str,
+    timestamp: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO file_access (session_id, request_id, file_path, access_type, read_range, timestamp)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![session_id, request_id, file_path, access_type, read_range, timestamp],
+    )?;
+    Ok(())
+}
+
+pub fn get_file_access_by_session(conn: &Connection, session_id: &str) -> Result<Vec<FileAccessRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, request_id, file_path, access_type, read_range, timestamp
+         FROM file_access WHERE session_id = ?1
+         ORDER BY timestamp ASC"
+    )?;
+    let rows = stmt.query_map(params![session_id], |row| {
+        Ok(FileAccessRecord {
+            session_id: row.get(0)?,
+            request_id: row.get(1)?,
+            file_path: row.get(2)?,
+            access_type: row.get(3)?,
+            read_range: row.get::<_, String>(4).unwrap_or_default(),
+            timestamp: row.get(5)?,
+        })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Returns cached supervisor result if request_count and pending_count both match.
+pub fn get_supervisor_cache(
+    conn: &Connection,
+    session_id: &str,
+    tool_name: &str,
+    current_request_count: i64,
+    current_pending_count: i64,
+) -> Result<Option<String>> {
+    let id = format!("{session_id}:{tool_name}");
+    let mut stmt = conn.prepare(
+        "SELECT result FROM supervisor_cache
+         WHERE id = ?1 AND request_count = ?2 AND pending_count = ?3"
+    )?;
+    let mut rows = stmt.query_map(params![id, current_request_count, current_pending_count], |row| {
+        row.get::<_, String>(0)
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn set_supervisor_cache(
+    conn: &Connection,
+    session_id: &str,
+    tool_name: &str,
+    request_count: i64,
+    pending_count: i64,
+    result: &str,
+) -> Result<()> {
+    let id = format!("{session_id}:{tool_name}");
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR REPLACE INTO supervisor_cache (id, session_id, tool_name, request_count, pending_count, result, cached_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, session_id, tool_name, request_count, pending_count, result, now],
+    )?;
     Ok(())
 }
 
@@ -1048,5 +1176,60 @@ mod tests {
         let found = get_request_by_id(&conn, "r1").unwrap().unwrap();
         assert_eq!(found.routing_category, "code_gen");
         assert_eq!(found.routed_to_url, "https://openai.com");
+    }
+
+    // ── Supervisor DB tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn file_access_insert_and_query() {
+        let conn = setup();
+        insert_file_access(&conn, "s1", "r1", "/src/main.rs", "read", "full", "2024-01-01T00:00:00Z").unwrap();
+        insert_file_access(&conn, "s1", "r1", "/src/db.rs", "edit", "", "2024-01-01T00:01:00Z").unwrap();
+        insert_file_access(&conn, "s2", "r2", "/other.rs", "read", "offset:10,limit:50", "2024-01-01T00:02:00Z").unwrap();
+
+        let accesses = get_file_access_by_session(&conn, "s1").unwrap();
+        assert_eq!(accesses.len(), 2);
+        assert_eq!(accesses[0].file_path, "/src/main.rs");
+        assert_eq!(accesses[0].access_type, "read");
+        assert_eq!(accesses[1].file_path, "/src/db.rs");
+        assert_eq!(accesses[1].access_type, "edit");
+    }
+
+    #[test]
+    fn supervisor_cache_hit_and_miss() {
+        let conn = setup();
+        set_supervisor_cache(&conn, "s1", "get_session_summary", 5, 1, r#"{"cached":true}"#).unwrap();
+
+        // Hit: same counts
+        let hit = get_supervisor_cache(&conn, "s1", "get_session_summary", 5, 1).unwrap();
+        assert_eq!(hit, Some(r#"{"cached":true}"#.to_string()));
+
+        // Miss: different request_count
+        let miss = get_supervisor_cache(&conn, "s1", "get_session_summary", 6, 1).unwrap();
+        assert!(miss.is_none());
+
+        // Miss: different pending_count
+        let miss = get_supervisor_cache(&conn, "s1", "get_session_summary", 5, 0).unwrap();
+        assert!(miss.is_none());
+
+        // Miss: different tool
+        let miss = get_supervisor_cache(&conn, "s1", "get_file_coverage", 5, 1).unwrap();
+        assert!(miss.is_none());
+    }
+
+    #[test]
+    fn delete_session_cascades_to_file_access_and_cache() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+        insert_file_access(&conn, "s1", "r1", "/src/main.rs", "read", "full", "2024-01-01T00:00:00Z").unwrap();
+        set_supervisor_cache(&conn, "s1", "summary", 1, 0, "{}").unwrap();
+
+        delete_session(&conn, "s1").unwrap();
+
+        let accesses = get_file_access_by_session(&conn, "s1").unwrap();
+        assert!(accesses.is_empty());
+        let cache = get_supervisor_cache(&conn, "s1", "summary", 1, 0).unwrap();
+        assert!(cache.is_none());
     }
 }
