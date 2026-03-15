@@ -111,6 +111,19 @@ pub async fn handle_dashboard(
             let sid = p.trim_start_matches("/api/supervisor/patterns/");
             full_to_box(serve_supervisor_patterns(&state, sid).await)
         }
+        // Files API (Code Viewer)
+        ("GET", p) if p.starts_with("/api/files/tree/") => {
+            let sid = p.trim_start_matches("/api/files/tree/");
+            full_to_box(serve_file_tree(&state, sid).await)
+        }
+        ("GET", p) if p.starts_with("/api/files/content/") => {
+            let sid = p.trim_start_matches("/api/files/content/");
+            full_to_box(serve_file_content(&state, sid, &query).await)
+        }
+        ("GET", p) if p.starts_with("/api/files/requests/") => {
+            let sid = p.trim_start_matches("/api/files/requests/");
+            full_to_box(serve_file_requests(&state, sid, &query).await)
+        }
         ("GET", "/events") => serve_sse_stream(&state),
         ("GET", _) => full_to_box(serve_static(&path)),
         _ => full_to_box(Response::builder().status(StatusCode::METHOD_NOT_ALLOWED)
@@ -664,6 +677,175 @@ async fn serve_supervisor_patterns(state: &AppState, session_id: &str) -> Respon
     let text = serde_json::to_string(&result).unwrap_or_default();
     let _ = db::set_supervisor_cache(&db, session_id, "detect_patterns", req_count, pending_count, &text);
     json_response(result)
+}
+
+// ── Files API handlers (Code Viewer) ─────────────────────────────────────────
+
+/// Get the CWD for a session, returning an error response if not found.
+async fn get_session_cwd(state: &AppState, session_id: &str) -> Result<String, Response<Full<Bytes>>> {
+    let db = state.db.lock().await;
+    let mut stmt = db.prepare("SELECT cwd FROM sessions WHERE id = ?1")
+        .map_err(|e| json_error(&e.to_string()))?;
+    let cwd: Option<String> = stmt.query_row(rusqlite::params![session_id], |row| row.get(0)).ok();
+    match cwd {
+        Some(c) if !c.is_empty() => Ok(c),
+        _ => Err(json_error("Session not found or has no CWD")),
+    }
+}
+
+/// Validate that a path is within the CWD (prevent path traversal).
+fn validate_path(cwd: &str, requested_path: &str) -> Result<std::path::PathBuf, Response<Full<Bytes>>> {
+    let cwd_canon = std::fs::canonicalize(cwd).map_err(|_| json_error("CWD not accessible"))?;
+    let full_path = if requested_path.starts_with('/') {
+        std::path::PathBuf::from(requested_path)
+    } else {
+        cwd_canon.join(requested_path)
+    };
+    let canon = std::fs::canonicalize(&full_path).map_err(|_| json_error("File not found"))?;
+    if !canon.starts_with(&cwd_canon) {
+        return Err(json_error("Path outside session CWD"));
+    }
+    Ok(canon)
+}
+
+async fn serve_file_tree(state: &AppState, session_id: &str) -> Response<Full<Bytes>> {
+    let cwd = match get_session_cwd(state, session_id).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    fn walk_dir(dir: &std::path::Path, depth: usize) -> serde_json::Value {
+        if depth > 8 { return serde_json::json!([]); }
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        let Ok(read_dir) = std::fs::read_dir(dir) else { return serde_json::json!([]); };
+
+        let mut items: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
+        items.sort_by(|a, b| {
+            let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            b_dir.cmp(&a_dir).then(a.file_name().cmp(&b.file_name()))
+        });
+
+        for entry in items {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip hidden dirs and common large dirs
+            if name.starts_with('.') || name == "node_modules" || name == "target"
+                || name == "__pycache__" || name == "dist" || name == "build" {
+                continue;
+            }
+            let path = entry.path();
+            let is_dir = path.is_dir();
+            if is_dir {
+                entries.push(serde_json::json!({
+                    "name": name,
+                    "path": path.to_string_lossy(),
+                    "type": "dir",
+                    "children": walk_dir(&path, depth + 1),
+                }));
+            } else {
+                entries.push(serde_json::json!({
+                    "name": name,
+                    "path": path.to_string_lossy(),
+                    "type": "file",
+                }));
+            }
+        }
+        serde_json::json!(entries)
+    }
+
+    let tree = walk_dir(std::path::Path::new(&cwd), 0);
+    json_response(tree)
+}
+
+async fn serve_file_content(state: &AppState, session_id: &str, query: &str) -> Response<Full<Bytes>> {
+    let cwd = match get_session_cwd(state, session_id).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    let params = parse_query(query);
+    let path = match params.get("path") {
+        Some(p) => url_decode(p),
+        None => return json_error("Missing 'path' parameter"),
+    };
+
+    let canon = match validate_path(&cwd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    // Read file content
+    match std::fs::read_to_string(&canon) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            json_response(serde_json::json!({
+                "path": canon.to_string_lossy(),
+                "lines": lines,
+                "total_lines": lines.len(),
+            }))
+        }
+        Err(_) => json_error("Cannot read file (binary or inaccessible)"),
+    }
+}
+
+async fn serve_file_requests(state: &AppState, session_id: &str, query: &str) -> Response<Full<Bytes>> {
+    let cwd = match get_session_cwd(state, session_id).await {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+
+    let params = parse_query(query);
+    let path = match params.get("path") {
+        Some(p) => url_decode(p),
+        None => return json_error("Missing 'path' parameter"),
+    };
+
+    let _ = match validate_path(&cwd, &path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let db = state.db.lock().await;
+
+    // Get all file_access records for this file in this session
+    let mut stmt = match db.prepare(
+        "SELECT fa.request_id, fa.access_type, fa.read_range, fa.timestamp,
+                r.agent_type, r.agent_task, r.request_body, r.response_body,
+                r.input_tokens, r.output_tokens, r.duration_ms, r.status
+         FROM file_access fa
+         JOIN requests r ON fa.request_id = r.id
+         WHERE fa.session_id = ?1 AND fa.file_path = ?2
+         ORDER BY fa.timestamp ASC"
+    ) {
+        Ok(s) => s,
+        Err(e) => return json_error(&e.to_string()),
+    };
+
+    let rows: Vec<serde_json::Value> = stmt.query_map(
+        rusqlite::params![session_id, path],
+        |row| {
+            Ok(serde_json::json!({
+                "request_id": row.get::<_, String>(0)?,
+                "access_type": row.get::<_, String>(1)?,
+                "read_range": row.get::<_, String>(2).unwrap_or_default(),
+                "timestamp": row.get::<_, String>(3)?,
+                "agent_type": row.get::<_, String>(4).unwrap_or_default(),
+                "agent_task": row.get::<_, String>(5).unwrap_or_default(),
+                "request_body": row.get::<_, String>(6).unwrap_or_default(),
+                "response_body": row.get::<_, Option<String>>(7).unwrap_or(None),
+                "input_tokens": row.get::<_, Option<i64>>(8).unwrap_or(None),
+                "output_tokens": row.get::<_, Option<i64>>(9).unwrap_or(None),
+                "duration_ms": row.get::<_, Option<i64>>(10).unwrap_or(None),
+                "status": row.get::<_, String>(11).unwrap_or_default(),
+            }))
+        }
+    ).ok().map(|r| r.filter_map(|v| v.ok()).collect()).unwrap_or_default();
+
+    json_response(serde_json::json!({
+        "file_path": path,
+        "request_count": rows.len(),
+        "requests": rows,
+    }))
 }
 
 fn url_decode(s: &str) -> String {

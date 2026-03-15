@@ -1,4 +1,4 @@
-import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest, getRoutingConfig, saveRoutingConfig, getRoutingRules, createRoutingRule, updateRoutingRule, deleteRoutingRule, reorderRoutingRules, testRoutingClassifier, getSessionSummary, getFileCoverage, getDetectPatterns } from './api.js'
+import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest, getRoutingConfig, saveRoutingConfig, getRoutingRules, createRoutingRule, updateRoutingRule, deleteRoutingRule, reorderRoutingRules, testRoutingClassifier, getSessionSummary, getFileCoverage, getDetectPatterns, getFileTree, getFileContent, getFileRequests } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -33,7 +33,13 @@ document.querySelector('#app').innerHTML = `
     <span id="routingLabel">⇄ Routes</span>
   </button>
   <button class="supervisor-btn" id="supervisorBtn" title="Supervisor analysis for selected session">
-    <span id="supervisorLabel">Supervisor</span>
+    <span id="supervisorLabel">&#x1F50D; Supervisor</span>
+  </button>
+  <button class="code-btn" id="codeBtn" title="Code Viewer - browse files with request annotations">
+    <span id="codeLabel">&#x1F4C4; Code</span>
+  </button>
+  <button class="prompt-view-btn" id="promptViewBtn" title="Switch to Request/Response view" style="display:none">
+    <span>&#x1F4AC; Prompt View</span>
   </button>
   <span class="header-meta" id="hMeta">Loading…</span>
 </header>
@@ -64,6 +70,8 @@ const $routingBtn      = document.getElementById('routingBtn')
 const $routingLabel    = document.getElementById('routingLabel')
 const $supervisorBtn   = document.getElementById('supervisorBtn')
 const $supervisorLabel = document.getElementById('supervisorLabel')
+const $codeBtn         = document.getElementById('codeBtn')
+const $promptViewBtn   = document.getElementById('promptViewBtn')
 const $hMeta       = document.getElementById('hMeta')
 const $sessionList = document.getElementById('sessionList')
 const $reqCount    = document.getElementById('reqCount')
@@ -150,6 +158,518 @@ $supervisorBtn.addEventListener('click', () => {
   routingPanelOpen = false
   renderSupervisorPanel(sid)
 })
+
+// ── Code Viewer Mode ─────────────────────────────────────────────────────────
+
+let codeViewerActive = false
+let codeViewerSessionId = null
+
+$codeBtn.addEventListener('click', () => {
+  const sid = selectedSession && selectedSession !== '__starred__'
+    ? selectedSession
+    : sessions.length > 0 ? sessions[0].id : null
+  if (!sid) return
+  enterCodeViewer(sid)
+})
+
+async function enterCodeViewer(sessionId, preloadPath, scrollToLine) {
+  codeViewerActive = true
+  codeViewerSessionId = sessionId
+  $promptViewBtn.style.display = ''
+  $codeBtn.style.display = 'none'
+  const sess = sessions.find(s => s.id === sessionId)
+  const projName = sess?.project_name || 'unknown'
+
+  document.querySelector('.layout').style.display = 'none'
+
+  let cvRoot = document.getElementById('codeViewerRoot')
+  if (!cvRoot) {
+    cvRoot = document.createElement('div')
+    cvRoot.id = 'codeViewerRoot'
+    cvRoot.className = 'cv-layout'
+    document.querySelector('.layout').after(cvRoot)
+  }
+
+  cvRoot.style.display = 'flex'
+  cvRoot.innerHTML = `
+    <div class="cv-body">
+      <nav class="sidebar" id="cvSidebar">
+        <div class="sidebar-section">Sessions</div>
+        <div id="cvSessionList"></div>
+        <div class="cv-sidebar-actions">
+          <button class="btn btn-sm cv-sidebar-btn" id="cvBack">&larr; Back</button>
+        </div>
+      </nav>
+      <div class="cv-tree" id="cvTree"><div class="cv-loading">Loading tree…</div></div>
+      <div class="cv-code" id="cvCode"><div class="cv-empty">Select a file from the tree</div></div>
+      <div class="cv-timeline" id="cvTimeline"><div class="cv-empty">Click an annotation to see request details</div></div>
+    </div>
+  `
+
+  // Render sessions in Code Viewer sidebar (same format as main dashboard)
+  const cvSessionList = document.getElementById('cvSessionList')
+  let sessHtml = ''
+  for (const s of sessions) {
+    const sel = s.id === sessionId
+    const live = s.pending_count > 0
+    const tok = s.total_input_tokens + s.total_output_tokens
+    const tokS = tok > 0 ? ` · ${tok >= 1000 ? (tok/1000).toFixed(1)+'k' : tok} tok` : ''
+    sessHtml += `<div class="${sel ? 'session-item selected' : 'session-item'}" data-cv-sid="${s.id}">
+      <div class="session-name"><span class="sdot ${live ? 'live' : 'idle'}"></span>${esc(s.project_name || 'unknown')}</div>
+      <div class="session-id" title="${s.id}">${s.id.slice(0, 8)}</div>
+      <div class="session-cwd">${esc(s.cwd || '')}</div>
+      <div class="session-stats">${s.request_count} req${tokS}</div>
+    </div>`
+  }
+  cvSessionList.innerHTML = sessHtml
+  cvSessionList.querySelectorAll('[data-cv-sid]').forEach(el => {
+    el.addEventListener('click', () => {
+      enterCodeViewer(el.dataset.cvSid)
+    })
+  })
+
+  document.getElementById('cvBack').addEventListener('click', exitCodeViewer)
+
+  // Load file tree
+  const tree = await getFileTree(sessionId)
+  document.getElementById('cvTree').innerHTML = renderFileTree(tree, sessionId)
+  bindTreeClicks(sessionId)
+
+  if (preloadPath) {
+    await loadCodeFile(sessionId, preloadPath, scrollToLine)
+  }
+}
+
+function exitCodeViewer() {
+  codeViewerActive = false
+  codeViewerSessionId = null
+  $promptViewBtn.style.display = 'none'
+  $codeBtn.style.display = ''
+  const cvRoot = document.getElementById('codeViewerRoot')
+  if (cvRoot) { cvRoot.style.display = 'none'; cvRoot.innerHTML = '' }
+  document.querySelector('.layout').style.display = 'flex'
+}
+
+$promptViewBtn.addEventListener('click', () => {
+  const sid = codeViewerSessionId
+  exitCodeViewer()
+  if (sid) {
+    selectedSession = sid
+    renderSessions()
+    loadRequests()
+  }
+})
+
+function renderFileTree(nodes, sessionId, depth = 0) {
+  if (!Array.isArray(nodes) || nodes.length === 0) return '<div class="cv-empty">No files</div>'
+  let html = '<ul class="cv-tree-list">'
+  for (const node of nodes) {
+    if (node.type === 'dir') {
+      html += `<li class="cv-tree-dir" style="padding-left:${depth * 12}px">
+        <span class="cv-tree-toggle" data-expanded="false">▶ ${esc(node.name)}</span>
+        <div class="cv-tree-children" style="display:none">${renderFileTree(node.children || [], sessionId, depth + 1)}</div>
+      </li>`
+    } else {
+      html += `<li class="cv-tree-file" style="padding-left:${(depth * 12) + 16}px" data-path="${esc(node.path)}" data-sid="${sessionId}">
+        ${esc(node.name)}
+      </li>`
+    }
+  }
+  html += '</ul>'
+  return html
+}
+
+function bindTreeClicks(sessionId) {
+  // Dir toggle
+  document.querySelectorAll('.cv-tree-toggle').forEach(toggle => {
+    toggle.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const li = toggle.closest('.cv-tree-dir')
+      const children = li.querySelector('.cv-tree-children')
+      const expanded = toggle.dataset.expanded === 'true'
+      children.style.display = expanded ? 'none' : 'block'
+      const dirName = toggle.textContent.replace(/^[▶▼]\s*/, '')
+      toggle.textContent = expanded ? `▶ ${dirName}` : `▼ ${dirName}`
+      toggle.dataset.expanded = expanded ? 'false' : 'true'
+    })
+  })
+  // File click
+  document.querySelectorAll('.cv-tree-file').forEach(file => {
+    file.addEventListener('click', () => {
+      document.querySelectorAll('.cv-tree-file.selected').forEach(f => f.classList.remove('selected'))
+      file.classList.add('selected')
+      loadCodeFile(sessionId, file.dataset.path)
+    })
+  })
+}
+
+async function loadCodeFile(sessionId, filePath, scrollToLine) {
+  const $code = document.getElementById('cvCode')
+  $code.innerHTML = '<div class="cv-loading">Loading…</div>'
+  document.getElementById('cvTimeline').innerHTML = '<div class="cv-empty">Click an annotation to see request details</div>'
+
+  const [fileData, reqData] = await Promise.all([
+    getFileContent(sessionId, filePath),
+    getFileRequests(sessionId, filePath),
+  ])
+
+  if (fileData.error) {
+    $code.innerHTML = `<div class="cv-empty">${esc(fileData.error)}</div>`
+    return
+  }
+
+  const lines = fileData.lines || []
+  const requests = reqData.requests || []
+
+  // Build line → requests mapping
+  const lineReqMap = buildLineRequestMap(lines.length, requests)
+
+  let html = '<div class="cv-code-inner">'
+  for (let i = 0; i < lines.length; i++) {
+    const lineNum = i + 1
+    const reqs = lineReqMap[lineNum] || []
+    const gutterHtml = reqs.map(r => {
+      const cls = r.access_type === 'edit' || r.access_type === 'write' ? 'cv-edit'
+        : r.access_type === 'read' ? 'cv-read' : 'cv-search'
+      return `<span class="cv-layer ${cls}" data-req-id="${r.request_id}" data-line="${lineNum}" title="#${r.request_id.slice(0,6)} ${r.agent_type} ${r.access_type} ${r.timestamp.slice(11,19)}"></span>`
+    }).join('')
+
+    html += `<div class="cv-line${scrollToLine === lineNum ? ' cv-highlight' : ''}" data-line="${lineNum}">
+      <span class="cv-linenum">${lineNum}</span>
+      <span class="cv-gutter">${gutterHtml}</span>
+      <span class="cv-text">${esc(lines[i])}</span>
+    </div>`
+  }
+  html += '</div>'
+  $code.innerHTML = html
+
+  // Scroll to line if requested
+  if (scrollToLine) {
+    const targetLine = $code.querySelector(`[data-line="${scrollToLine}"]`)
+    if (targetLine) targetLine.scrollIntoView({ block: 'center' })
+  }
+
+  // Bind layer clicks
+  $code.querySelectorAll('.cv-layer').forEach(layer => {
+    layer.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const lineNum = parseInt(layer.dataset.line)
+      const lineReqs = lineReqMap[lineNum] || []
+      renderTimeline(lineNum, lineReqs)
+    })
+  })
+
+  // Also bind line click (click on line number area)
+  $code.querySelectorAll('.cv-linenum').forEach(ln => {
+    ln.addEventListener('click', () => {
+      const lineNum = parseInt(ln.closest('.cv-line').dataset.line)
+      const lineReqs = lineReqMap[lineNum] || []
+      if (lineReqs.length > 0) renderTimeline(lineNum, lineReqs)
+    })
+  })
+}
+
+function buildLineRequestMap(totalLines, requests) {
+  const map = {} // lineNum -> [{request_id, access_type, ...}]
+  for (const r of requests) {
+    let startLine = 1, endLine = totalLines
+    if (r.access_type === 'search') {
+      // Search: file-level, no specific lines — skip line mapping
+      continue
+    }
+    if (r.read_range && r.read_range !== 'full' && r.read_range !== '') {
+      // Parse "offset:N,limit:M"
+      const parts = {}
+      r.read_range.split(',').forEach(p => { const [k, v] = p.split(':'); parts[k] = parseInt(v) })
+      if (parts.offset !== undefined) startLine = parts.offset + 1
+      if (parts.limit !== undefined) endLine = startLine + parts.limit - 1
+    }
+    // Cap to actual file size
+    if (r.read_range === 'full' || r.read_range === '' || r.read_range === 'default') {
+      // Default read limit is 2000
+      endLine = Math.min(totalLines, 2000)
+    }
+    endLine = Math.min(endLine, totalLines)
+    for (let line = startLine; line <= endLine; line++) {
+      if (!map[line]) map[line] = []
+      // Avoid duplicates
+      if (!map[line].some(x => x.request_id === r.request_id)) {
+        map[line].push(r)
+      }
+    }
+  }
+  // Sort each line's requests by timestamp (oldest first = leftmost layer)
+  for (const line in map) {
+    map[line].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+  }
+  return map
+}
+
+function renderTimeline(lineNum, requests) {
+  const $timeline = document.getElementById('cvTimeline')
+  if (requests.length === 0) {
+    $timeline.innerHTML = '<div class="cv-empty">No requests for this line</div>'
+    return
+  }
+
+  let html = `<div class="cv-timeline-header">Line ${lineNum} — ${requests.length} request${requests.length > 1 ? 's' : ''}</div>`
+  let prevSummary = ''
+  for (let ri = 0; ri < requests.length; ri++) {
+    const r = requests[ri]
+    const prevReqBody = ri > 0 ? requests[ri - 1].request_body : null
+    const accessCls = r.access_type === 'edit' || r.access_type === 'write' ? 'cv-access-edit'
+      : r.access_type === 'read' ? 'cv-access-read' : 'cv-access-search'
+    const promptSummary = extractRequestSummary(r.request_body)
+    const respSummary = extractResponseSummary(r.response_body)
+    // If prompt is same as previous request, show response summary instead to differentiate
+    const summary = (promptSummary === prevSummary && respSummary) ? respSummary : promptSummary
+    const summaryLabel = (promptSummary === prevSummary && respSummary) ? 'resp' : 'prompt'
+    prevSummary = promptSummary
+    html += `<div class="cv-req-card">
+      <div class="cv-req-header">
+        <span class="cv-req-time">${esc(r.timestamp.slice(11, 19))}</span>
+        <span class="cv-req-id">#${esc(r.request_id.slice(0, 8))}</span>
+        <span class="cv-req-agent">${esc(r.agent_type)}</span>
+        <span class="${accessCls}">${esc(r.access_type)}</span>
+      </div>
+      ${summary ? `<div class="cv-req-summary ${summaryLabel === 'resp' ? 'cv-req-summary-resp' : ''}">${esc(summary)}</div>` : ''}
+      ${r.agent_task ? `<div class="cv-req-task">${esc(r.agent_task)}</div>` : ''}
+      <div class="cv-req-meta">${r.input_tokens ?? '-'} in / ${r.output_tokens ?? '-'} out${r.duration_ms ? ' · ' + r.duration_ms + 'ms' : ''}</div>
+      <details class="cv-req-details"><summary>Prompt</summary><pre class="cv-req-pre">${esc(formatPrompt(r.request_body, prevReqBody))}</pre></details>
+      <details class="cv-req-details"><summary>Raw Prompt</summary><pre class="cv-req-pre cv-req-raw">${esc(formatRawPrompt(r.request_body))}</pre></details>
+      <details class="cv-req-details"><summary>Response</summary><pre class="cv-req-pre">${esc(formatResponse(r.response_body))}</pre></details>
+    </div>`
+  }
+  $timeline.innerHTML = html
+}
+
+function formatPrompt(requestBody, prevRequestBody) {
+  try {
+    const body = JSON.parse(requestBody)
+    const msgs = body.messages || []
+
+    // Determine which messages are NEW (not in previous request)
+    let prevMsgCount = 0
+    if (prevRequestBody) {
+      try {
+        const prevBody = JSON.parse(prevRequestBody)
+        prevMsgCount = (prevBody.messages || []).length
+      } catch {}
+    }
+    const newMsgs = msgs.slice(prevMsgCount)
+    if (newMsgs.length === 0 && msgs.length > 0) {
+      // Fallback: show last 2 messages
+      newMsgs.push(...msgs.slice(-2))
+    }
+
+    // Collect tool_use IDs → tool_result content for merging
+    const toolResults = {}
+    for (const m of newMsgs) {
+      if (m.role !== 'user') continue
+      const blocks = Array.isArray(m.content) ? m.content : []
+      for (const b of blocks) {
+        if (b.type === 'tool_result' && b.tool_use_id) {
+          const content = typeof b.content === 'string' ? b.content
+            : Array.isArray(b.content) ? b.content.map(x => x.text || '').join('')
+            : ''
+          const lines = content.split('\n')
+          const isFileContent = lines.length > 3 && /^\s*\d+→/.test(lines[0])
+          if (isFileContent) {
+            const lastLine = [...lines].reverse().find(l => /^\s*\d+→/.test(l))
+            const lastMatch = lastLine ? lastLine.match(/^\s*(\d+)→/) : null
+            toolResults[b.tool_use_id] = `${lines.length} lines, L1-${lastMatch ? lastMatch[1] : '?'}`
+          } else if (content.length > 200) {
+            toolResults[b.tool_use_id] = `${content.length} chars`
+          } else {
+            toolResults[b.tool_use_id] = content.slice(0, 100)
+          }
+        }
+      }
+    }
+
+    const parts = []
+    if (prevMsgCount > 0 && msgs.length > prevMsgCount) {
+      parts.push(`(${prevMsgCount} previous messages hidden)`)
+    }
+
+    for (const m of newMsgs) {
+      const role = m.role || '?'
+      if (typeof m.content === 'string') {
+        if (m.content.startsWith('<system-reminder>')) continue
+        parts.push(`[${role}] ${m.content.slice(0, 300)}`)
+        continue
+      }
+      if (!Array.isArray(m.content)) continue
+      const lines = []
+      for (const b of m.content) {
+        if (b.type === 'tool_use') {
+          const name = b.name || '?'
+          const input = b.input || {}
+          const path = input.file_path || input.path || ''
+          const short = path ? path.split('/').slice(-2).join('/') : ''
+          if (name === 'Read' && short) {
+            const o = input.offset, l = input.limit
+            const lineCount = toolResults[b.id] || ''
+            const countNum = lineCount.match(/^(\d+) lines/)
+            if (o != null || l != null) {
+              const start = (o||0)+1, len = l || '?'
+              lines.push(`[Read: ${short} — L${start}-${typeof len === 'number' ? start+len-1 : '?'} (${len} lines)]`)
+            } else {
+              lines.push(`[Read: ${short} — ${countNum ? countNum[1]+' lines, full' : 'full'}]`)
+            }
+          } else if (name === 'Edit' && short) {
+            lines.push(`[Edit: ${short}]`)
+          } else if (name === 'Write' && short) {
+            lines.push(`[Write: ${short}]`)
+          } else if (short) {
+            lines.push(`[${name}: ${short}]`)
+          } else {
+            lines.push(`[${name}]`)
+          }
+        } else if (b.type === 'tool_result') {
+          continue
+        } else if (b.type === 'text') {
+          const t = (b.text || '').trim()
+          if (t && !t.startsWith('<system-reminder>')) {
+            lines.push(t.length > 300 ? t.slice(0, 300) + '…' : t)
+          }
+        }
+      }
+      if (lines.length > 0) parts.push(`[${role}]\n${lines.join('\n')}`)
+    }
+    return parts.join('\n\n---\n\n')
+  } catch { return requestBody || '' }
+}
+
+/** Collapse tool_result file contents into compact tags */
+function collapseBlock(block) {
+  if (typeof block === 'string') return block
+  if (!block || typeof block !== 'object') return JSON.stringify(block)
+
+  // tool_result with file content → collapse
+  if (block.type === 'tool_result') {
+    const content = typeof block.content === 'string' ? block.content
+      : Array.isArray(block.content) ? block.content.map(x => x.text || '').join('')
+      : ''
+    // Detect numbered file content (e.g. "     1→#include..." from Read tool)
+    const lines = content.split('\n')
+    if (lines.length > 5 && /^\s*\d+→/.test(lines[0])) {
+      // Extract first and last line numbers
+      const firstMatch = lines[0].match(/^\s*(\d+)→/)
+      const lastLine = [...lines].reverse().find(l => /^\s*\d+→/.test(l))
+      const lastMatch = lastLine ? lastLine.match(/^\s*(\d+)→/) : null
+      const start = firstMatch ? firstMatch[1] : '?'
+      const end = lastMatch ? lastMatch[1] : '?'
+      return `[tool_result: ${lines.length} lines → L${start}-${end}]`
+    }
+    // Non-file content, just truncate if long
+    if (content.length > 300) {
+      return `[tool_result: ${content.length} chars]\n${content.slice(0, 200)}…`
+    }
+    return block.text || content || JSON.stringify(block)
+  }
+
+  // tool_use → show compact form
+  if (block.type === 'tool_use') {
+    const name = block.name || '?'
+    const input = block.input || {}
+    const path = input.file_path || input.path || ''
+    if (path) {
+      const short = path.split('/').slice(-2).join('/')
+      const offset = input.offset, limit = input.limit
+      if (name === 'Read') {
+        if (offset != null || limit != null) {
+          const s = (offset || 0) + 1, e = limit ? s + limit - 1 : '?'
+          return `[${name}: ${short} L${s}-${e}]`
+        }
+        return `[${name}: ${short} full]`
+      }
+      return `[${name}: ${short}]`
+    }
+    return `[${name}: ${JSON.stringify(input).slice(0, 100)}]`
+  }
+
+  // text block
+  if (block.text) return block.text
+  return JSON.stringify(block)
+}
+
+function formatResponse(responseBody) {
+  if (!responseBody) return '(no response)'
+  try {
+    const body = JSON.parse(responseBody)
+    if (body.accumulated_content) return body.accumulated_content
+    if (body.content) {
+      if (Array.isArray(body.content)) {
+        return body.content.map(b => collapseBlock(b)).join('\n')
+      }
+      return typeof body.content === 'string' ? body.content : JSON.stringify(body.content, null, 2)
+    }
+    return JSON.stringify(body, null, 2).slice(0, 5000)
+  } catch { return (responseBody || '').slice(0, 5000) }
+}
+
+function formatRawPrompt(requestBody) {
+  try {
+    const body = JSON.parse(requestBody)
+    return JSON.stringify(body, null, 2)
+  } catch { return requestBody || '' }
+}
+
+function extractRequestSummary(requestBody) {
+  try {
+    const body = JSON.parse(requestBody)
+    const msgs = body.messages || []
+    // Find the last user message (= the actual prompt for this request)
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role !== 'user') continue
+      const content = msgs[i].content
+      let text = ''
+      if (typeof content === 'string') {
+        text = content
+      } else if (Array.isArray(content)) {
+        // Find last text block that isn't a system-reminder
+        for (let j = content.length - 1; j >= 0; j--) {
+          const t = content[j].text || ''
+          if (t && !t.startsWith('<system-reminder>')) { text = t; break }
+        }
+      }
+      if (text) {
+        // Trim and truncate
+        text = text.trim().replace(/\n+/g, ' ')
+        return text.length > 120 ? text.slice(0, 120) + '…' : text
+      }
+    }
+  } catch {}
+  return ''
+}
+
+function extractResponseSummary(responseBody) {
+  if (!responseBody) return ''
+  try {
+    const body = JSON.parse(responseBody)
+    let text = ''
+    if (body.accumulated_content) {
+      text = body.accumulated_content
+    } else if (body.content) {
+      if (Array.isArray(body.content)) {
+        text = body.content.map(b => b.text || '').filter(Boolean).join(' ')
+      } else if (typeof body.content === 'string') {
+        text = body.content
+      }
+    }
+    if (text) {
+      text = text.trim().replace(/\n+/g, ' ')
+      return text.length > 150 ? text.slice(0, 150) + '…' : text
+    }
+  } catch {}
+  return ''
+}
+
+// Global function for cross-linking from Supervisor and Request Detail
+window.openCodeViewer = function(sessionId, filePath, lineNum) {
+  enterCodeViewer(sessionId, filePath, lineNum)
+}
 
 function renderRoutingPanel() {
   if (!routingPanelOpen) return
@@ -930,7 +1450,7 @@ async function renderSupervisorPanel(sessionId) {
             readStatus = '<span class="sv-partial-read">partial</span>'
           }
           return `<tr>
-          <td class="sv-filepath">${esc(f.file_path)}</td>
+          <td class="sv-filepath"><a href="#" class="sv-file-link" data-path="${esc(f.file_path)}">${esc(f.file_path)}</a></td>
           <td>${(f.access_types || []).map(t => `<span class="sv-access-${t}">${t}</span>`).join(' ')}</td>
           <td>${readStatus}</td>
           <td>${f.access_count}</td>
@@ -983,6 +1503,14 @@ async function renderSupervisorPanel(sessionId) {
     } else {
       $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
     }
+  })
+
+  // File path links → Code Viewer
+  document.querySelectorAll('.sv-file-link').forEach(link => {
+    link.addEventListener('click', (e) => {
+      e.preventDefault()
+      enterCodeViewer(sessionId, link.dataset.path)
+    })
   })
 }
 
