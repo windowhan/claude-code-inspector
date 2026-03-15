@@ -156,6 +156,23 @@ export async function getDetectPatterns(sessionId) {
   return r.json()
 }
 
+// ── Files API (Code Viewer) ──────────────────────────────────────────────────
+
+export async function getFileTree(sessionId) {
+  const r = await fetch(`${BASE}/api/files/tree/${sessionId}`)
+  return r.json()
+}
+
+export async function getFileContent(sessionId, path) {
+  const r = await fetch(`${BASE}/api/files/content/${sessionId}?path=${encodeURIComponent(path)}`)
+  return r.json()
+}
+
+export async function getFileRequests(sessionId, path) {
+  const r = await fetch(`${BASE}/api/files/requests/${sessionId}?path=${encodeURIComponent(path)}`)
+  return r.json()
+}
+
 /** Connect to SSE stream and call cb on each event */
 export function connectEvents(cb) {
   let es
