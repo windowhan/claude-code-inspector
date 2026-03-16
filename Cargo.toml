@@ -34,5 +34,6 @@ tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
 tree-sitter-rust = "0.23"
 tree-sitter-java = "0.23"
+shlex = "1"
 # tree-sitter-solidity requires ABI v15, incompatible with tree-sitter 0.24 (v14)
 # TODO: re-enable when tree-sitter 0.25+ is stable

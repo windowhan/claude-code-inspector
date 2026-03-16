@@ -39,6 +39,263 @@ fn file_access_from_tool_use(name: &str, input: &Value) -> Option<(String, Strin
     Some((file_path.to_string(), access_type.to_string(), read_range))
 }
 
+// ── Bash command parsing ─────────────────────────────────────────────────────
+
+/// Paths that should be excluded from file access tracking.
+const IGNORED_PATHS: &[&str] = &["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin"];
+
+/// Extract file accesses from a Bash tool_use input.
+/// Parses the shell command string using shlex for proper tokenization,
+/// then splits on shell operators (|, &&, ;, ||) and extracts file operands
+/// based on the recognized command.
+fn file_accesses_from_bash(input: &Value) -> Vec<(String, String, String)> {
+    let command = match input.get("command").and_then(|c| c.as_str()) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+
+    // Tokenize the full command with shlex first (handles quotes/escapes correctly)
+    let tokens = match shlex::split(command) {
+        Some(t) => t,
+        None => return Vec::new(), // Unmatched quotes — silently skip
+    };
+
+    // Split token list on shell operators to get command segments
+    let segments = split_on_shell_operators(&tokens);
+    let mut accesses = Vec::new();
+
+    for segment in &segments {
+        if segment.is_empty() { continue; }
+
+        // Extract redirections first, then process the command
+        let (cmd_tokens, redirections) = extract_redirections(segment);
+
+        // Add write accesses for redirection targets
+        for redir_target in &redirections {
+            if !redir_target.is_empty() && !IGNORED_PATHS.contains(&redir_target.as_str()) {
+                accesses.push((redir_target.clone(), "write".to_string(), String::new()));
+            }
+        }
+
+        if cmd_tokens.is_empty() { continue; }
+        let program = cmd_tokens[0].as_str();
+        // Strip path prefix (e.g., /usr/bin/cat -> cat)
+        let program = program.rsplit('/').next().unwrap_or(program);
+        // Skip prefix commands like sudo, env
+        let (program, args) = skip_prefix_commands(program, &cmd_tokens[1..]);
+
+        let file_accesses = extract_files_for_command(program, args);
+        for (path, access_type) in file_accesses {
+            if !path.is_empty() && !IGNORED_PATHS.contains(&path.as_str()) {
+                accesses.push((path, access_type, String::new()));
+            }
+        }
+    }
+
+    accesses
+}
+
+/// Split a token list on shell operators: |, &&, ||, ;
+fn split_on_shell_operators(tokens: &[String]) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+
+    for token in tokens {
+        if token == "|" || token == "&&" || token == "||" || token == ";" {
+            if !current.is_empty() {
+                segments.push(current);
+                current = Vec::new();
+            }
+        } else {
+            current.push(token.clone());
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Extract redirection targets from a token list.
+/// Returns (remaining_command_tokens, redirection_target_paths).
+/// Handles both `> file` (space) and `>file` (no space) forms.
+fn extract_redirections(tokens: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut cmd_tokens = Vec::new();
+    let mut redirections = Vec::new();
+    let mut skip_next = false;
+
+    for (i, token) in tokens.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if token == ">" || token == ">>" {
+            // Next token is the target file
+            if let Some(next) = tokens.get(i + 1) {
+                redirections.push(next.clone());
+                skip_next = true;
+            }
+        } else if let Some(path) = token.strip_prefix(">>") {
+            // >>file (no space)
+            if !path.is_empty() {
+                redirections.push(path.to_string());
+            }
+        } else if let Some(path) = token.strip_prefix('>') {
+            // >file (no space), but skip fd redirections like 2>
+            if !path.is_empty() {
+                redirections.push(path.to_string());
+            }
+        } else if token.contains('>') && token.ends_with('>') {
+            // e.g., "2>" — next token is target
+            if let Some(next) = tokens.get(i + 1) {
+                redirections.push(next.clone());
+                skip_next = true;
+            }
+        } else {
+            cmd_tokens.push(token.clone());
+        }
+    }
+
+    (cmd_tokens, redirections)
+}
+
+/// Skip prefix commands like sudo, env, nohup and return the real program + args.
+fn skip_prefix_commands<'a>(program: &'a str, args: &'a [String]) -> (&'a str, &'a [String]) {
+    match program {
+        "sudo" | "env" | "nohup" | "nice" | "time" => {
+            if let Some(_first) = args.first() {
+                // Skip env's KEY=VALUE args
+                let mut skip = 0;
+                for arg in args {
+                    if arg.contains('=') && program == "env" {
+                        skip += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if skip < args.len() {
+                    return (args[skip].as_str(), &args[skip + 1..]);
+                }
+            }
+            (program, args)
+        }
+        _ => (program, args),
+    }
+}
+
+/// Extract file paths from a recognized command's arguments.
+fn extract_files_for_command(program: &str, args: &[String]) -> Vec<(String, String)> {
+    match program {
+        // Read commands: all non-flag positional args are files
+        "cat" | "head" | "tail" | "less" | "more" | "bat" | "wc" => {
+            extract_positional_file_args(args, "read")
+        }
+        // Search commands: grep/rg/ag — first non-flag arg is pattern, rest are paths
+        "grep" | "rg" | "ag" => {
+            extract_grep_files(args)
+        }
+        // find: first non-flag arg is the search directory
+        "find" => {
+            extract_find_directory(args)
+        }
+        // sed -i: last non-flag arg is the file (write access)
+        "sed" => {
+            // Only track as write if -i flag is present
+            if args.iter().any(|a| a == "-i" || a.starts_with("-i")) {
+                extract_last_positional_arg(args, "write")
+            } else {
+                Vec::new()
+            }
+        }
+        // awk: last non-flag arg is the file (read access)
+        "awk" => {
+            extract_last_positional_arg(args, "read")
+        }
+        // tee: all non-flag args are write targets
+        "tee" => {
+            extract_positional_file_args(args, "write")
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Extract all positional (non-flag) arguments as file paths.
+fn extract_positional_file_args(args: &[String], access_type: &str) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next { skip_next = false; continue; }
+        if arg.starts_with('-') {
+            // Flags with values: -n 10, -c 5, etc. Skip the flag and its value.
+            if arg.len() == 2 && arg != "--" {
+                skip_next = true;
+            }
+            continue;
+        }
+        if arg.starts_with('$') || arg.starts_with('`') { continue; } // Skip variables/subshells
+        files.push((arg.clone(), access_type.to_string()));
+    }
+    files
+}
+
+/// Extract file paths from grep/rg/ag arguments.
+/// Algorithm: skip flags (tokens starting with -). First non-flag token is the pattern.
+/// All subsequent non-flag tokens are file paths (search access).
+fn extract_grep_files(args: &[String]) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let mut found_pattern = false;
+    let mut skip_next = false;
+
+    // Flags that take a value argument
+    let flags_with_value = ["-e", "-f", "-m", "-A", "-B", "-C", "--include", "--exclude",
+                            "--include-dir", "--exclude-dir", "--max-count", "--color",
+                            "--type", "-t", "-g", "--glob"];
+
+    for arg in args {
+        if skip_next { skip_next = false; continue; }
+        if arg.starts_with('-') {
+            if flags_with_value.iter().any(|f| arg == *f) {
+                skip_next = true;
+            }
+            continue;
+        }
+        if arg.starts_with('$') || arg.starts_with('`') { continue; }
+        if !found_pattern {
+            found_pattern = true; // This is the search pattern, skip it
+            continue;
+        }
+        files.push((arg.clone(), "search".to_string()));
+    }
+    files
+}
+
+/// Extract find's search directory (first non-flag argument).
+fn extract_find_directory(args: &[String]) -> Vec<(String, String)> {
+    // find [path...] [expression...]
+    // Path args come before any expression (which start with - or ()
+    let mut dirs = Vec::new();
+    for arg in args {
+        if arg.starts_with('-') || arg == "(" || arg == ")" || arg == "!" {
+            break; // Start of expression
+        }
+        if arg.starts_with('$') || arg.starts_with('`') { continue; }
+        dirs.push((arg.clone(), "search".to_string()));
+    }
+    dirs
+}
+
+/// Extract the last positional (non-flag) argument as a file path.
+fn extract_last_positional_arg(args: &[String], access_type: &str) -> Vec<(String, String)> {
+    let positional: Vec<&String> = args.iter()
+        .filter(|a| !a.starts_with('-') && !a.starts_with('$') && !a.starts_with('`'))
+        .collect();
+    if let Some(last) = positional.last() {
+        vec![((*last).clone(), access_type.to_string())]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Extract file accesses from a raw Anthropic SSE response.
 /// Parses only the tool_use content blocks that Claude generated in THIS response turn,
 /// so each access is correctly attributed to the specific request that produced it.
@@ -76,7 +333,9 @@ pub fn extract_file_accesses_from_sse(raw_sse: &[u8]) -> Vec<(String, String, St
     for (_, (name, input_json)) in &tool_blocks {
         if input_json.is_empty() { continue }
         let Ok(input) = serde_json::from_str::<Value>(input_json) else { continue };
-        if let Some(acc) = file_access_from_tool_use(name, &input) {
+        if name == "Bash" {
+            accesses.extend(file_accesses_from_bash(&input));
+        } else if let Some(acc) = file_access_from_tool_use(name, &input) {
             accesses.push(acc);
         }
     }
@@ -92,7 +351,9 @@ pub fn extract_file_accesses_from_response(resp_body: &str) -> Vec<(String, Stri
         if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") { continue }
         let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
         let Some(input) = block.get("input") else { continue };
-        if let Some(acc) = file_access_from_tool_use(name, input) {
+        if name == "Bash" {
+            accesses.extend(file_accesses_from_bash(input));
+        } else if let Some(acc) = file_access_from_tool_use(name, input) {
             accesses.push(acc);
         }
     }
@@ -147,6 +408,12 @@ fn extract_file_accesses(request_body: &str) -> Vec<(String, String, String)> {
                 Some(i) => i,
                 None => continue,
             };
+
+            // Bash tool: delegate to bash parser
+            if name == "Bash" {
+                accesses.extend(file_accesses_from_bash(input));
+                continue;
+            }
 
             let access_type = match name {
                 "Read" => "read",
@@ -570,6 +837,176 @@ mod tests {
         assert_eq!(summary["total_output_tokens"], 10);
         assert_eq!(summary["error_count"], 1);
         assert_eq!(summary["requests"].as_array().unwrap().len(), 2);
+    }
+
+    // ── Bash file access parsing tests ──────────────────────────────────────
+
+    #[test]
+    fn bash_cat_read() {
+        let input = serde_json::json!({"command": "cat /path/file.rs", "description": "Read file"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("/path/file.rs".into(), "read".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_cat_multiple_files() {
+        let input = serde_json::json!({"command": "cat a.rs b.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("a.rs".into(), "read".into(), String::new()));
+        assert_eq!(result[1], ("b.rs".into(), "read".into(), String::new()));
+    }
+
+    #[test]
+    fn bash_grep_search() {
+        let input = serde_json::json!({"command": "grep -r pattern src/"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("src/".into(), "search".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_grep_multiple_files() {
+        let input = serde_json::json!({"command": "grep pattern file1.rs file2.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("file1.rs".into(), "search".into(), String::new()));
+        assert_eq!(result[1], ("file2.rs".into(), "search".into(), String::new()));
+    }
+
+    #[test]
+    fn bash_sed_write() {
+        let input = serde_json::json!({"command": "sed -i 's/foo/bar/' file.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("file.rs".into(), "write".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_sed_without_i_no_write() {
+        let input = serde_json::json!({"command": "sed 's/foo/bar/' file.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert!(result.is_empty()); // sed without -i is not a write
+    }
+
+    #[test]
+    fn bash_redirect_write() {
+        let input = serde_json::json!({"command": "echo data > output.txt"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("output.txt".into(), "write".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_redirect_no_space() {
+        let input = serde_json::json!({"command": "echo data >output.txt"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("output.txt".into(), "write".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_append_redirect() {
+        let input = serde_json::json!({"command": "echo data >> log.txt"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("log.txt".into(), "write".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_pipe_cat_grep() {
+        let input = serde_json::json!({"command": "cat a.rs | grep foo"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("a.rs".into(), "read".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_quoted_pipe_in_pattern() {
+        // grep "foo|bar" should NOT split on | inside quotes
+        let input = serde_json::json!({"command": "grep \"foo|bar\" src/main.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("src/main.rs".into(), "search".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_and_chain() {
+        let input = serde_json::json!({"command": "cd /tmp && cat file.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("file.rs".into(), "read".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_semicolon_chain() {
+        let input = serde_json::json!({"command": "cat a.rs ; cat b.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("a.rs".into(), "read".into(), String::new()));
+        assert_eq!(result[1], ("b.rs".into(), "read".into(), String::new()));
+    }
+
+    #[test]
+    fn bash_head_with_flags() {
+        let input = serde_json::json!({"command": "head -n 20 /src/main.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("/src/main.rs".into(), "read".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_find_directory() {
+        let input = serde_json::json!({"command": "find src/ -name '*.rs'"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("src/".into(), "search".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_tee_write() {
+        let input = serde_json::json!({"command": "cat input.rs | tee output.rs"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("input.rs".into(), "read".into(), String::new()));
+        assert_eq!(result[1], ("output.rs".into(), "write".into(), String::new()));
+    }
+
+    #[test]
+    fn bash_dev_null_filtered() {
+        let input = serde_json::json!({"command": "echo data > /dev/null"});
+        let result = file_accesses_from_bash(&input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn bash_sudo_prefix() {
+        let input = serde_json::json!({"command": "sudo cat /etc/passwd"});
+        let result = file_accesses_from_bash(&input);
+        assert_eq!(result, vec![("/etc/passwd".into(), "read".into(), String::new())]);
+    }
+
+    #[test]
+    fn bash_empty_command() {
+        let input = serde_json::json!({"command": ""});
+        let result = file_accesses_from_bash(&input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn bash_no_command_field() {
+        let input = serde_json::json!({"description": "something"});
+        let result = file_accesses_from_bash(&input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn bash_unrecognized_command() {
+        let input = serde_json::json!({"command": "cargo build --release"});
+        let result = file_accesses_from_bash(&input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn bash_in_extract_file_accesses() {
+        // Test the #[cfg(test)] helper integration
+        let body = r#"{"model":"claude","messages":[
+            {"role":"assistant","content":[
+                {"type":"tool_use","name":"Bash","input":{"command":"cat /src/main.rs"}}
+            ]}
+        ]}"#;
+        let result = extract_file_accesses(body);
+        assert_eq!(result, vec![("/src/main.rs".into(), "read".into(), String::new())]);
     }
 
     #[test]
