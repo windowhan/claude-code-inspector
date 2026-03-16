@@ -32,11 +32,11 @@ struct Args {
     command: Option<Command>,
 
     /// Proxy listen address
-    #[arg(long, default_value = "127.0.0.1:7878", global = true)]
+    #[arg(long, default_value = "0.0.0.0:7878", global = true)]
     proxy_addr: String,
 
     /// Dashboard listen address
-    #[arg(long, default_value = "127.0.0.1:7879", global = true)]
+    #[arg(long, default_value = "0.0.0.0:7879", global = true)]
     dashboard_addr: String,
 
     /// Database path (defaults to platform data dir / claude-code-hook / logs.db)
@@ -91,8 +91,22 @@ async fn run_server(state: Arc<AppState>, proxy_addr: &str, dashboard_addr: &str
     let proxy_addr: SocketAddr     = proxy_addr.parse()?;
     let dashboard_addr: SocketAddr = dashboard_addr.parse()?;
 
-    let proxy_listener     = TcpListener::bind(proxy_addr).await?;
-    let dashboard_listener = TcpListener::bind(dashboard_addr).await?;
+    let proxy_listener = match TcpListener::bind(proxy_addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            println!("claude-code-hook is already running on {proxy_addr}. Exiting.");
+            std::process::exit(0);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let dashboard_listener = match TcpListener::bind(dashboard_addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            println!("claude-code-hook is already running on {dashboard_addr}. Exiting.");
+            std::process::exit(0);
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     println!();
     println!("  Claude Code LLM API Inspector");

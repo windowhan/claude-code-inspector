@@ -395,10 +395,16 @@ async function enterCodeViewer(sessionId, preloadPath, scrollToLine) {
   })
 
   // Load file tree + coverage data
-  const [tree, coverageData] = await Promise.all([
-    getFileTree(sessionId),
-    getFileCoverage(sessionId),
-  ])
+  let tree, coverageData
+  try {
+    ;[tree, coverageData] = await Promise.all([
+      getFileTree(sessionId),
+      getFileCoverage(sessionId),
+    ])
+  } catch (err) {
+    document.getElementById('cvTree').innerHTML = `<div class="cv-empty">Error: ${esc(String(err))}</div>`
+    return
+  }
   // Build coverage map: file_path → {lines_read, total_lines, has_full_read}
   const coverageMap = {}
   for (const f of (coverageData.files || [])) {
@@ -509,10 +515,16 @@ async function loadCodeFile(sessionId, filePath, scrollToLine) {
   $code.innerHTML = '<div class="cv-loading">Loading…</div>'
   document.getElementById('cvTimeline').innerHTML = '<div class="cv-empty">Click an annotation to see request details</div>'
 
-  const [fileData, reqData] = await Promise.all([
-    getFileContent(sessionId, filePath),
-    getFileRequests(sessionId, filePath),
-  ])
+  let fileData, reqData
+  try {
+    ;[fileData, reqData] = await Promise.all([
+      getFileContent(sessionId, filePath),
+      getFileRequests(sessionId, filePath),
+    ])
+  } catch (err) {
+    $code.innerHTML = `<div class="cv-empty">Failed to load: ${esc(String(err))}</div>`
+    return
+  }
 
   if (fileData.error) {
     $code.innerHTML = `<div class="cv-empty">${esc(fileData.error)}</div>`
@@ -604,7 +616,7 @@ async function loadCodeFile(sessionId, filePath, scrollToLine) {
       ? `<div class="cv-func-marker ${func.covered ? 'cv-func-marker-covered' : 'cv-func-marker-uncovered'}">${esc(func.kind)}: ${esc(func.name)} (L${func.start_line}-${func.end_line}) ${func.covered ? `— ${func.requests.length} req` : '— NOT COVERED'}</div>`
       : ''
 
-    html += `${funcMarker}<div class="cv-line${scrollToLine === lineNum ? ' cv-highlight' : ''}${topReq ? ' cv-line-touched' : ''}" data-line="${lineNum}">
+    html += `${funcMarker}<div class="cv-line${scrollToLine === lineNum ? ' cv-highlight' : ''}${reqs.length > 0 ? ' cv-line-touched' : ''}" data-line="${lineNum}">
       <span class="cv-linenum">${lineNum}</span>
       <span class="cv-text">${esc(lines[i])}</span>
       ${annotationHtml}
@@ -803,10 +815,13 @@ function formatPrompt(requestBody, prevRequestBody) {
         prevMsgCount = (prevBody.messages || []).length
       } catch {}
     }
-    const newMsgs = msgs.slice(prevMsgCount)
+    let newMsgs = msgs.slice(prevMsgCount)
     if (newMsgs.length === 0 && msgs.length > 0) {
       // Fallback: show last 2 messages
-      newMsgs.push(...msgs.slice(-2))
+      newMsgs = msgs.slice(-2)
+    } else if (newMsgs.length > 20) {
+      // Sanity check: delta too large means prevMsgCount was likely wrong, show last 4
+      newMsgs = msgs.slice(-4)
     }
 
     // Collect tool_use IDs → tool_result content for merging
@@ -832,10 +847,8 @@ function formatPrompt(requestBody, prevRequestBody) {
               const shortPaths = pathLines.slice(0, 8).map(p => p.trim().split('/').slice(-2).join('/'))
               const suffix = pathLines.length > 8 ? ` +${pathLines.length - 8} more` : ''
               toolResults[b.tool_use_id] = `${pathLines.length} files: ${shortPaths.join(', ')}${suffix}`
-            } else if (content.length > 200) {
-              toolResults[b.tool_use_id] = `${content.length} chars`
             } else {
-              toolResults[b.tool_use_id] = content.slice(0, 150)
+              toolResults[b.tool_use_id] = content
             }
           }
         }
@@ -851,7 +864,7 @@ function formatPrompt(requestBody, prevRequestBody) {
       const role = m.role || '?'
       if (typeof m.content === 'string') {
         if (m.content.startsWith('<system-reminder>')) continue
-        parts.push(`[${role}] ${m.content.slice(0, 300)}`)
+        parts.push(`[${role}] ${m.content}`)
         continue
       }
       if (!Array.isArray(m.content)) continue
@@ -897,7 +910,7 @@ function formatPrompt(requestBody, prevRequestBody) {
         } else if (b.type === 'text') {
           const t = (b.text || '').trim()
           if (t && !t.startsWith('<system-reminder>')) {
-            lines.push(t.length > 300 ? t.slice(0, 300) + '…' : t)
+            lines.push(t)
           }
         }
       }

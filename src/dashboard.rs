@@ -757,15 +757,16 @@ async fn serve_summarize(state: &AppState, body: &[u8]) -> Response<Full<Bytes>>
         let ts = r.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
         let req_id = r.get("request_id").and_then(|v| v.as_str()).unwrap_or("?");
 
-        // Extract file paths from tool_use blocks (full paths, not truncated)
         let req_body = r.get("request_body").and_then(|v| v.as_str()).unwrap_or("");
-        let file_paths = extract_tool_file_paths(req_body);
+        let resp_body = r.get("response_body").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Extract last user message as the prompt
+        // Extract file paths from response body (accurate per-request attribution)
+        let file_paths = extract_tool_file_paths(resp_body);
+
+        // Extract last user message as the prompt (skip tool_result-only messages)
         let prompt_text = extract_last_user_text(req_body);
 
         // Extract response summary
-        let resp_body = r.get("response_body").and_then(|v| v.as_str()).unwrap_or("");
         let resp_text = extract_response_text(resp_body);
 
         context.push_str(&format!("--- Request {} (id:{} {} {} {} {}) ---\nFiles accessed: {}\nPrompt: {}\nResponse: {}\n\n",
@@ -947,27 +948,20 @@ async fn serve_summarizer_models(state: &AppState, body: &[u8]) -> Response<Full
     json_response(serde_json::json!({ "models": models, "cached": false }))
 }
 
-fn extract_tool_file_paths(request_body: &str) -> Vec<String> {
-    let mut paths = Vec::new();
-    if let Ok(body) = serde_json::from_str::<serde_json::Value>(request_body) {
-        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
-            for m in msgs {
-                if m.get("role").and_then(|r| r.as_str()) != Some("assistant") { continue; }
-                if let Some(content) = m.get("content").and_then(|c| c.as_array()) {
-                    for b in content {
-                        if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") { continue; }
-                        let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                        if !matches!(name, "Read" | "Write" | "Edit" | "Grep" | "Glob") { continue; }
-                        let input = b.get("input").unwrap_or(&serde_json::Value::Null);
-                        if let Some(p) = input.get("file_path").or(input.get("path")).and_then(|v| v.as_str()) {
-                            if !p.is_empty() && !paths.contains(&p.to_string()) {
-                                paths.push(p.to_string());
-                            }
-                        }
-                    }
-                }
-            }
+fn extract_tool_file_paths(response_body: &str) -> Vec<String> {
+    // Use response-based extractors to avoid cumulative messages pollution
+    let accesses = if let Ok(body) = serde_json::from_str::<serde_json::Value>(response_body) {
+        if let Some(raw_sse) = body.get("raw_sse").and_then(|v| v.as_str()) {
+            supervisor::extract_file_accesses_from_sse(raw_sse.as_bytes())
+        } else {
+            supervisor::extract_file_accesses_from_response(response_body)
         }
+    } else {
+        Vec::new()
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for (path, _, _) in accesses {
+        if !paths.contains(&path) { paths.push(path); }
     }
     paths
 }
@@ -981,7 +975,13 @@ fn extract_last_user_text(request_body: &str) -> String {
                     if !s.starts_with("<system-reminder>") { return s.to_string(); }
                 }
                 if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                    // Skip messages that only contain tool_result blocks (no human text)
+                    let all_tool_results = arr.iter().all(|b| {
+                        b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                    });
+                    if all_tool_results { continue; }
                     for b in arr.iter().rev() {
+                        if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") { continue; }
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                             if !t.starts_with("<system-reminder>") { return t.to_string(); }
                         }
@@ -1009,7 +1009,8 @@ fn extract_response_text(response_body: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max { s.to_string() } else { format!("{}…", chars[..max].iter().collect::<String>()) }
 }
 
 // ── Files API handlers (Code Viewer) ─────────────────────────────────────────

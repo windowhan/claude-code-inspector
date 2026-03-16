@@ -99,8 +99,11 @@ pub fn extract_file_accesses_from_response(resp_body: &str) -> Vec<(String, Stri
     accesses
 }
 
-/// Extract file accesses from request_body (kept for tests; prefer the response-based variants).
-pub fn extract_file_accesses(request_body: &str) -> Vec<(String, String, String)> {
+/// Extract file accesses from request_body.
+/// NOTE: This iterates ALL accumulated messages — only use in tests.
+/// For production use extract_file_accesses_from_sse / extract_file_accesses_from_response.
+#[cfg(test)]
+fn extract_file_accesses(request_body: &str) -> Vec<(String, String, String)> {
     let mut accesses = Vec::new();
 
     let body: Value = match serde_json::from_str(request_body) {
@@ -220,8 +223,8 @@ pub fn build_session_summary(requests: &[RequestRecord]) -> Value {
                 .and_then(|b| b.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
                 .unwrap_or_default();
 
-            // Count tool_use blocks in request_body (assistant messages)
-            let tool_calls = count_tool_calls(&r.request_body);
+            // Count tool_use blocks from response (accurate per-request attribution)
+            let tool_calls = count_tool_calls(r.response_body.as_deref().unwrap_or(""));
 
             json!({
                 "request_id": r.id,
@@ -250,22 +253,31 @@ pub fn build_session_summary(requests: &[RequestRecord]) -> Value {
     })
 }
 
-fn count_tool_calls(request_body: &str) -> Value {
+fn count_tool_calls(response_body: &str) -> Value {
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
-    if let Ok(body) = serde_json::from_str::<Value>(request_body) {
-        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            for msg in messages {
-                if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-                    continue;
-                }
-                if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-                    for block in content {
+    if let Ok(body) = serde_json::from_str::<Value>(response_body) {
+        // SSE response: {"accumulated_content": "...", "raw_sse": "..."}
+        if let Some(raw_sse) = body.get("raw_sse").and_then(|v| v.as_str()) {
+            for line in raw_sse.lines() {
+                let Some(json_str) = line.strip_prefix("data: ") else { continue };
+                let Ok(json) = serde_json::from_str::<Value>(json_str) else { continue };
+                if json.get("type").and_then(|t| t.as_str()) == Some("content_block_start") {
+                    if let Some(block) = json.get("content_block") {
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                 *counts.entry(name.to_string()).or_insert(0) += 1;
                             }
                         }
+                    }
+                }
+            }
+        } else if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
+            // Non-streaming response: {"content": [...]}
+            for block in content {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                        *counts.entry(name.to_string()).or_insert(0) += 1;
                     }
                 }
             }
