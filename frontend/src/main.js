@@ -41,6 +41,7 @@ document.querySelector('#app').innerHTML = `
   <button class="prompt-view-btn" id="promptViewBtn" title="Switch to Request/Response view" style="display:none">
     <span>&#x1F4AC; Prompt View</span>
   </button>
+  <button class="settings-btn" id="settingsBtn" title="Configure Summarizer LLM">&#x2699; Settings</button>
   <span class="header-meta" id="hMeta">Loading…</span>
 </header>
 <div class="layout">
@@ -146,6 +147,140 @@ $routingBtn.addEventListener('click', () => {
   }
 })
 
+document.getElementById('settingsBtn').addEventListener('click', async () => {
+  routingPanelOpen = false
+  const resp = await fetch('/api/summarizer/config')
+  const config = await resp.json()
+  const providers = {
+    anthropic: { url: 'https://api.anthropic.com', models: [
+      'claude-haiku-4-5-20251001', 'claude-sonnet-4-20250514', 'claude-opus-4-20250514',
+      'claude-3-5-haiku-20241022', 'claude-3-5-sonnet-20241022',
+    ]},
+    openai: { url: 'https://api.openai.com', models: [
+      'gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1', 'gpt-4.1-nano',
+      'o4-mini', 'o3', 'o3-mini',
+    ]},
+    deepseek: { url: 'https://api.deepseek.com', models: [
+      'deepseek-chat', 'deepseek-reasoner',
+    ]},
+    kimi: { url: 'https://api.moonshot.cn', models: [
+      'moonshot-v1-8k', 'moonshot-v1-32k', 'moonshot-v1-128k',
+    ]},
+  }
+  const curProvider = config.provider || 'anthropic'
+
+  // Auto-fetch models if API key is configured
+  let liveModels = null
+  if (config.configured) {
+    try {
+      const mResp = await fetch('/api/summarizer/models', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: curProvider, base_url: config.base_url || providers[curProvider].url, api_key: '***' })
+      })
+      const mData = await mResp.json()
+      if (mData.models && mData.models.length > 0) liveModels = mData.models
+    } catch {}
+  }
+  const modelList = liveModels || providers[curProvider].models
+
+  $detail.innerHTML = `
+    <div class="sv-panel">
+      <div class="sv-header"><span>Summarizer LLM Settings</span><button class="btn btn-sm" id="settingsClose">Close</button></div>
+      <div class="sv-section">
+        <div class="meta-row"><span class="meta-label">Provider</span>
+          <select class="memo-input" id="sumProvider" style="flex:1">
+            <option value="anthropic" ${curProvider === 'anthropic' ? 'selected' : ''}>Anthropic (Claude)</option>
+            <option value="openai" ${curProvider === 'openai' ? 'selected' : ''}>OpenAI (GPT)</option>
+            <option value="deepseek" ${curProvider === 'deepseek' ? 'selected' : ''}>DeepSeek</option>
+            <option value="kimi" ${curProvider === 'kimi' ? 'selected' : ''}>Kimi (Moonshot)</option>
+          </select>
+        </div>
+        <div class="meta-row"><span class="meta-label">API Endpoint</span><input type="text" class="memo-input" id="sumBaseUrl" value="${esc(config.base_url || providers[curProvider].url)}" style="flex:1"></div>
+        <div class="meta-row"><span class="meta-label">API Key</span><input type="text" class="memo-input" id="sumApiKey" value="${esc(config.api_key || '')}" placeholder="Enter API key" style="flex:1"></div>
+        <div class="meta-row"><span class="meta-label">Model</span>
+          <select class="memo-input" id="sumModel" style="flex:1">
+            ${modelList.map(m => `<option value="${m}" ${m === (config.model || modelList[0]) ? 'selected' : ''}>${m}</option>`).join('')}
+          </select>
+          <button class="btn btn-sm" id="sumFetchModels" style="margin-left:6px" title="Fetch latest models from provider">Fetch</button>
+        </div>
+        <div class="meta-row"><span class="meta-label">Language</span>
+          <select class="memo-input" id="sumLanguage" style="flex:1">
+            ${['English','Korean','Japanese','Chinese','Spanish','German','French','Russian','Portuguese'].map(l =>
+              `<option value="${l}" ${l === (config.language || 'English') ? 'selected' : ''}>${l}</option>`
+            ).join('')}
+          </select>
+        </div>
+        <div style="margin-top:12px"><button class="btn btn-primary" id="sumSave">Save</button> <span id="sumStatus" style="font-size:12px;color:var(--text-muted)"></span></div>
+      </div>
+    </div>`
+  // Auto-fill endpoint and model list when provider changes
+  document.getElementById('sumProvider').addEventListener('change', (e) => {
+    const p = providers[e.target.value]
+    if (p) {
+      document.getElementById('sumBaseUrl').value = p.url
+      const modelSelect = document.getElementById('sumModel')
+      modelSelect.innerHTML = p.models.map(m => `<option value="${m}">${m}</option>`).join('')
+    }
+  })
+  // Fetch live models from provider
+  document.getElementById('sumFetchModels').addEventListener('click', async () => {
+    const btn = document.getElementById('sumFetchModels')
+    btn.disabled = true
+    btn.textContent = '...'
+    try {
+      const resp = await fetch('/api/summarizer/models', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          provider: document.getElementById('sumProvider').value,
+          base_url: document.getElementById('sumBaseUrl').value.trim(),
+          api_key: document.getElementById('sumApiKey').value.trim(),
+        })
+      })
+      const data = await resp.json()
+      if (data.error) {
+        btn.textContent = 'Error'
+        btn.title = data.error
+      } else if (data.models && data.models.length > 0) {
+        const modelSelect = document.getElementById('sumModel')
+        const curVal = modelSelect.value
+        modelSelect.innerHTML = data.models.map(m => `<option value="${m}" ${m === curVal ? 'selected' : ''}>${m}</option>`).join('')
+        btn.textContent = `${data.models.length} models`
+      } else {
+        btn.textContent = '0 models'
+      }
+    } catch (e) {
+      btn.textContent = 'Error'
+      btn.title = e.message
+    }
+    btn.disabled = false
+    setTimeout(() => { btn.textContent = 'Fetch' }, 3000)
+  })
+  document.getElementById('settingsClose').addEventListener('click', () => {
+    if (selectedRequest) loadDetail(selectedRequest)
+    else $detail.innerHTML = '<div class="detail-empty">Select a request to inspect</div>'
+  })
+  document.getElementById('sumSave').addEventListener('click', async () => {
+    const status = document.getElementById('sumStatus')
+    status.textContent = 'Saving…'
+    await fetch('/api/summarizer/config', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        provider: document.getElementById('sumProvider').value,
+        base_url: document.getElementById('sumBaseUrl').value.trim(),
+        api_key: document.getElementById('sumApiKey').value.trim(),
+        model: document.getElementById('sumModel').value,
+        language: document.getElementById('sumLanguage').value,
+      })
+    })
+    status.textContent = 'Saved!'
+    status.style.color = 'var(--green)'
+    setTimeout(() => { status.textContent = '' }, 2000)
+  })
+})
+
 $supervisorBtn.addEventListener('click', () => {
   // Use selected session, or first session if none selected
   const sid = selectedSession && selectedSession !== '__starred__'
@@ -201,7 +336,9 @@ async function enterCodeViewer(sessionId, preloadPath, scrollToLine) {
         </div>
       </nav>
       <div class="cv-tree" id="cvTree"><div class="cv-loading">Loading tree…</div></div>
+      <div class="cv-resize-handle" data-resize="tree"></div>
       <div class="cv-code" id="cvCode"><div class="cv-empty">Select a file from the tree</div></div>
+      <div class="cv-resize-handle" data-resize="timeline"></div>
       <div class="cv-timeline" id="cvTimeline"><div class="cv-empty">Click an annotation to see request details</div></div>
     </div>
   `
@@ -230,9 +367,44 @@ async function enterCodeViewer(sessionId, preloadPath, scrollToLine) {
 
   document.getElementById('cvBack').addEventListener('click', exitCodeViewer)
 
-  // Load file tree
-  const tree = await getFileTree(sessionId)
-  document.getElementById('cvTree').innerHTML = renderFileTree(tree, sessionId)
+  // Resize handles for panels
+  document.querySelectorAll('.cv-resize-handle').forEach(handle => {
+    handle.addEventListener('mousedown', (e) => {
+      e.preventDefault()
+      const target = handle.dataset.resize
+      const startX = e.clientX
+      const tree = document.getElementById('cvTree')
+      const timeline = document.getElementById('cvTimeline')
+      const startWidth = target === 'tree' ? tree.offsetWidth : timeline.offsetWidth
+
+      const onMove = (ev) => {
+        const dx = ev.clientX - startX
+        if (target === 'tree') {
+          tree.style.width = Math.max(100, startWidth + dx) + 'px'
+        } else {
+          timeline.style.width = Math.max(150, startWidth - dx) + 'px'
+        }
+      }
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove)
+        document.removeEventListener('mouseup', onUp)
+      }
+      document.addEventListener('mousemove', onMove)
+      document.addEventListener('mouseup', onUp)
+    })
+  })
+
+  // Load file tree + coverage data
+  const [tree, coverageData] = await Promise.all([
+    getFileTree(sessionId),
+    getFileCoverage(sessionId),
+  ])
+  // Build coverage map: file_path → {lines_read, total_lines, has_full_read}
+  const coverageMap = {}
+  for (const f of (coverageData.files || [])) {
+    coverageMap[f.file_path] = { lines_read: f.lines_read || 0, total_lines: f.total_lines || 0, has_full_read: f.has_full_read || false }
+  }
+  document.getElementById('cvTree').innerHTML = renderFileTree(tree, sessionId, 0, coverageMap)
   bindTreeClicks(sessionId)
 
   if (preloadPath) {
@@ -260,23 +432,52 @@ $promptViewBtn.addEventListener('click', () => {
   }
 })
 
-function renderFileTree(nodes, sessionId, depth = 0) {
+function renderFileTree(nodes, sessionId, depth = 0, coverageMap = {}) {
   if (!Array.isArray(nodes) || nodes.length === 0) return '<div class="cv-empty">No files</div>'
   let html = '<ul class="cv-tree-list">'
   for (const node of nodes) {
     if (node.type === 'dir') {
+      // Aggregate coverage for all files in this directory (recursive)
+      const dirCov = aggregateDirCoverage(node, coverageMap)
+      const dirCovLabel = dirCov.total > 0 ? `(${dirCov.covered}/${dirCov.total})` : ''
+      const dirFullCls = dirCov.total > 0 && dirCov.covered === dirCov.total ? ' cv-tree-full' : ''
       html += `<li class="cv-tree-dir" style="padding-left:${depth * 12}px">
-        <span class="cv-tree-toggle" data-expanded="false">▶ ${esc(node.name)}</span>
-        <div class="cv-tree-children" style="display:none">${renderFileTree(node.children || [], sessionId, depth + 1)}</div>
+        <span class="cv-tree-toggle${dirFullCls}" data-expanded="false">▶ ${dirCovLabel ? `<span class="cv-tree-cov">${dirCovLabel}</span> ` : ''}${esc(node.name)}</span>
+        <div class="cv-tree-children" style="display:none">${renderFileTree(node.children || [], sessionId, depth + 1, coverageMap)}</div>
       </li>`
     } else {
-      html += `<li class="cv-tree-file" style="padding-left:${(depth * 12) + 16}px" data-path="${esc(node.path)}" data-sid="${sessionId}">
-        ${esc(node.name)}
+      const cov = coverageMap[node.path]
+      const totalLines = cov ? cov.total_lines : (node.total_lines > 0 ? node.total_lines : 0)
+      const linesRead = cov ? cov.lines_read : 0
+      let fullCls = ''
+      if (totalLines > 0 && linesRead >= totalLines) fullCls = ' cv-tree-full'
+      const covLabel = totalLines > 0 ? `<span class="cv-tree-cov">(${linesRead}/${totalLines})</span> ` : ''
+      html += `<li class="cv-tree-file${fullCls}" style="padding-left:${(depth * 12) + 16}px" data-path="${esc(node.path)}" data-sid="${sessionId}">
+        ${covLabel}${esc(node.name)}
       </li>`
     }
   }
   html += '</ul>'
   return html
+}
+
+function aggregateDirCoverage(dirNode, coverageMap) {
+  let covered = 0, total = 0
+  const children = dirNode.children || []
+  for (const child of children) {
+    if (child.type === 'dir') {
+      const sub = aggregateDirCoverage(child, coverageMap)
+      covered += sub.covered
+      total += sub.total
+    } else {
+      const cov = coverageMap[child.path]
+      const fileTotal = cov ? cov.total_lines : (child.total_lines > 0 ? child.total_lines : 0)
+      const fileRead = cov ? cov.lines_read : 0
+      covered += fileRead
+      total += fileTotal
+    }
+  }
+  return { covered, total }
 }
 
 function bindTreeClicks(sessionId) {
@@ -320,24 +521,92 @@ async function loadCodeFile(sessionId, filePath, scrollToLine) {
 
   const lines = fileData.lines || []
   const requests = reqData.requests || []
+  const funcs = fileData.functions || []
+  const language = fileData.language || null
 
   // Build line → requests mapping
   const lineReqMap = buildLineRequestMap(lines.length, requests)
 
-  let html = '<div class="cv-code-inner">'
+  // Build function coverage: which functions were touched by which requests
+  const funcCoverage = funcs.map(f => {
+    const touchedReqs = new Map() // request_id → {access_type, agent_type, timestamp}
+    for (let line = f.start_line; line <= f.end_line; line++) {
+      for (const r of (lineReqMap[line] || [])) {
+        if (!touchedReqs.has(r.request_id)) {
+          touchedReqs.set(r.request_id, r)
+        }
+      }
+    }
+    return { ...f, requests: [...touchedReqs.values()], covered: touchedReqs.size > 0 }
+  })
+
+  const coveredCount = funcCoverage.filter(f => f.covered).length
+  const totalFuncs = funcCoverage.length
+
+  // File summary + function coverage table
+  let html = ''
+  if (funcs.length > 0) {
+    const uniqueReqIds = new Set()
+    requests.forEach(r => uniqueReqIds.add(r.request_id))
+    html += `<div class="cv-file-summary">
+      <div class="cv-summary-header">
+        <span class="cv-summary-title">${esc(filePath.split('/').pop())}${language ? ` <span class="cv-lang">${language}</span>` : ''}</span>
+        <span class="cv-summary-stats">${coveredCount}/${totalFuncs} functions covered · ${uniqueReqIds.size} requests · ${lines.length} lines</span>
+      </div>
+      <table class="cv-func-table">
+        <tr><th>Function</th><th>Lines</th><th>Coverage</th><th>Requests</th></tr>
+        ${funcCoverage.map(f => {
+          const lineRange = `L${f.start_line}-${f.end_line}`
+          const covCls = f.covered ? 'cv-func-covered' : 'cv-func-uncovered'
+          const reqBadges = f.requests.slice(0, 5).map(r => {
+            const cls = r.access_type === 'edit' || r.access_type === 'write' ? 'cv-edit' : r.access_type === 'read' ? 'cv-read' : 'cv-search'
+            return `<span class="cv-func-req ${cls}" title="#${r.request_id.slice(0,8)} ${r.agent_type} ${r.access_type}">${r.agent_type}</span>`
+          }).join('')
+          const more = f.requests.length > 5 ? `<span class="cv-func-more">+${f.requests.length - 5}</span>` : ''
+          return `<tr class="cv-func-row" data-start="${f.start_line}">
+            <td><span class="cv-func-name">${esc(f.name)}</span> <span class="cv-func-kind">${f.kind}</span></td>
+            <td class="cv-func-lines">${lineRange}</td>
+            <td><span class="${covCls}">${f.covered ? 'covered' : 'NOT covered'}</span></td>
+            <td>${reqBadges}${more}</td>
+          </tr>`
+        }).join('')}
+      </table>
+    </div>`
+  }
+
+  // Build set of function start lines for markers
+  const funcStartLines = new Set(funcs.map(f => f.start_line))
+  const funcByStartLine = {}
+  for (const f of funcCoverage) { funcByStartLine[f.start_line] = f }
+
+  html += '<div class="cv-code-inner">'
   for (let i = 0; i < lines.length; i++) {
     const lineNum = i + 1
     const reqs = lineReqMap[lineNum] || []
-    const gutterHtml = reqs.map(r => {
-      const cls = r.access_type === 'edit' || r.access_type === 'write' ? 'cv-edit'
-        : r.access_type === 'read' ? 'cv-read' : 'cv-search'
-      return `<span class="cv-layer ${cls}" data-req-id="${r.request_id}" data-line="${lineNum}" title="#${r.request_id.slice(0,6)} ${r.agent_type} ${r.access_type} ${r.timestamp.slice(11,19)}"></span>`
-    }).join('')
+    // Build inline annotation (right side, git-blame style)
+    // Show the most recent/important request for this line
+    const topReq = reqs.length > 0 ? reqs[reqs.length - 1] : null
+    const extraCount = reqs.length > 1 ? reqs.length - 1 : 0
+    const annotationHtml = topReq
+      ? (() => {
+          const cls = topReq.access_type === 'edit' || topReq.access_type === 'write' ? 'cv-ann-edit' : topReq.access_type === 'read' ? 'cv-ann-read' : 'cv-ann-search'
+          const range = topReq.read_range && topReq.read_range !== 'full' && topReq.read_range !== ''
+            ? (() => { const p = {}; topReq.read_range.split(',').forEach(s => { const [k,v] = s.split(':'); p[k] = parseInt(v) }); return ` L${(p.offset||0)+1}-${(p.offset||0)+(p.limit||0)}`; })()
+            : topReq.read_range === 'full' ? ' full' : ''
+          return `<span class="cv-annotation ${cls}" data-line="${lineNum}">#${topReq.request_id.slice(0,6)} ${topReq.agent_type} ${topReq.access_type}${range}${extraCount > 0 ? ` +${extraCount}` : ''}</span>`
+        })()
+      : ''
 
-    html += `<div class="cv-line${scrollToLine === lineNum ? ' cv-highlight' : ''}" data-line="${lineNum}">
+    // Function boundary marker
+    const func = funcByStartLine[lineNum]
+    const funcMarker = func
+      ? `<div class="cv-func-marker ${func.covered ? 'cv-func-marker-covered' : 'cv-func-marker-uncovered'}">${esc(func.kind)}: ${esc(func.name)} (L${func.start_line}-${func.end_line}) ${func.covered ? `— ${func.requests.length} req` : '— NOT COVERED'}</div>`
+      : ''
+
+    html += `${funcMarker}<div class="cv-line${scrollToLine === lineNum ? ' cv-highlight' : ''}${topReq ? ' cv-line-touched' : ''}" data-line="${lineNum}">
       <span class="cv-linenum">${lineNum}</span>
-      <span class="cv-gutter">${gutterHtml}</span>
       <span class="cv-text">${esc(lines[i])}</span>
+      ${annotationHtml}
     </div>`
   }
   html += '</div>'
@@ -349,22 +618,34 @@ async function loadCodeFile(sessionId, filePath, scrollToLine) {
     if (targetLine) targetLine.scrollIntoView({ block: 'center' })
   }
 
-  // Bind layer clicks
-  $code.querySelectorAll('.cv-layer').forEach(layer => {
-    layer.addEventListener('click', (e) => {
+  // Bind annotation clicks
+  $code.querySelectorAll('.cv-annotation').forEach(ann => {
+    ann.addEventListener('click', (e) => {
       e.stopPropagation()
-      const lineNum = parseInt(layer.dataset.line)
+      const lineNum = parseInt(ann.dataset.line)
       const lineReqs = lineReqMap[lineNum] || []
       renderTimeline(lineNum, lineReqs)
+      // Highlight selected annotation
+      $code.querySelectorAll('.cv-annotation.active').forEach(a => a.classList.remove('active'))
+      ann.classList.add('active')
     })
   })
 
-  // Also bind line click (click on line number area)
-  $code.querySelectorAll('.cv-linenum').forEach(ln => {
-    ln.addEventListener('click', () => {
-      const lineNum = parseInt(ln.closest('.cv-line').dataset.line)
+  // Also bind line click
+  $code.querySelectorAll('.cv-line-touched').forEach(line => {
+    line.addEventListener('click', () => {
+      const lineNum = parseInt(line.dataset.line)
       const lineReqs = lineReqMap[lineNum] || []
       if (lineReqs.length > 0) renderTimeline(lineNum, lineReqs)
+    })
+  })
+
+  // Function table row click → scroll to function
+  document.querySelectorAll('.cv-func-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const startLine = parseInt(row.dataset.start)
+      const target = $code.querySelector(`[data-line="${startLine}"]`)
+      if (target) target.scrollIntoView({ block: 'center', behavior: 'smooth' })
     })
   })
 }
@@ -412,11 +693,28 @@ function renderTimeline(lineNum, requests) {
     return
   }
 
-  let html = `<div class="cv-timeline-header">Line ${lineNum} — ${requests.length} request${requests.length > 1 ? 's' : ''}</div>`
+  // Sort by timestamp and deduplicate by request_id
+  const seen = new Set()
+  const uniqueReqs = requests.filter(r => { if (seen.has(r.request_id)) return false; seen.add(r.request_id); return true })
+
+  // Sort by message count ascending to find correct prev for delta
+  const withMsgCount = uniqueReqs.map(r => {
+    let msgCount = 0
+    try { msgCount = (JSON.parse(r.request_body).messages || []).length } catch {}
+    return { ...r, _msgCount: msgCount }
+  }).sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+
+  // Store current timeline data for summarize button
+  window._currentTimelineData = { lineNum, requests: withMsgCount }
+
+  let html = `<div class="cv-timeline-header">Line ${lineNum} — ${withMsgCount.length} request${withMsgCount.length > 1 ? 's' : ''} <button class="btn btn-sm cv-summarize-btn" id="cvSummarize">Summarize</button></div>`
   let prevSummary = ''
-  for (let ri = 0; ri < requests.length; ri++) {
-    const r = requests[ri]
-    const prevReqBody = ri > 0 ? requests[ri - 1].request_body : null
+  for (let ri = 0; ri < withMsgCount.length; ri++) {
+    const r = withMsgCount[ri]
+    // Find the closest previous request by message count (the one with fewer messages)
+    const prevReqBody = ri > 0
+      ? withMsgCount.slice(0, ri).sort((a, b) => b._msgCount - a._msgCount).find(p => p._msgCount < r._msgCount)?.request_body || null
+      : null
     const accessCls = r.access_type === 'edit' || r.access_type === 'write' ? 'cv-access-edit'
       : r.access_type === 'read' ? 'cv-access-read' : 'cv-access-search'
     const promptSummary = extractRequestSummary(r.request_body)
@@ -432,8 +730,6 @@ function renderTimeline(lineNum, requests) {
         <span class="cv-req-agent">${esc(r.agent_type)}</span>
         <span class="${accessCls}">${esc(r.access_type)}</span>
       </div>
-      ${summary ? `<div class="cv-req-summary ${summaryLabel === 'resp' ? 'cv-req-summary-resp' : ''}">${esc(summary)}</div>` : ''}
-      ${r.agent_task ? `<div class="cv-req-task">${esc(r.agent_task)}</div>` : ''}
       <div class="cv-req-meta">${r.input_tokens ?? '-'} in / ${r.output_tokens ?? '-'} out${r.duration_ms ? ' · ' + r.duration_ms + 'ms' : ''}</div>
       <details class="cv-req-details"><summary>Prompt</summary><pre class="cv-req-pre">${esc(formatPrompt(r.request_body, prevReqBody))}</pre></details>
       <details class="cv-req-details"><summary>Raw Prompt</summary><pre class="cv-req-pre cv-req-raw">${esc(formatRawPrompt(r.request_body))}</pre></details>
@@ -441,6 +737,50 @@ function renderTimeline(lineNum, requests) {
     </div>`
   }
   $timeline.innerHTML = html
+
+  // Summarize button handler
+  const sumBtn = document.getElementById('cvSummarize')
+  if (sumBtn) {
+    sumBtn.addEventListener('click', async () => {
+      sumBtn.disabled = true
+      sumBtn.textContent = 'Summarizing…'
+      try {
+        const data = window._currentTimelineData
+        const resp = await fetch('/api/summarize', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            line: data.lineNum,
+            requests: data.requests.map(r => ({
+              request_id: r.request_id,
+              agent_type: r.agent_type,
+              access_type: r.access_type,
+              read_range: r.read_range,
+              timestamp: r.timestamp,
+              request_body: r.request_body,
+              response_body: r.response_body,
+            }))
+          })
+        })
+        const result = await resp.json()
+        if (result.error) {
+          sumBtn.textContent = 'Error'
+          sumBtn.title = result.error
+        } else {
+          // Insert summary at top of timeline
+          const summaryDiv = document.createElement('div')
+          summaryDiv.className = 'cv-summary-result'
+          summaryDiv.innerHTML = `<div class="cv-summary-label">AI Summary</div><pre class="cv-req-pre">${esc(result.summary)}</pre>`
+          $timeline.querySelector('.cv-timeline-header').after(summaryDiv)
+          sumBtn.textContent = 'Summarize'
+        }
+      } catch (e) {
+        sumBtn.textContent = 'Error'
+        sumBtn.title = e.message
+      }
+      sumBtn.disabled = false
+    })
+  }
 }
 
 function formatPrompt(requestBody, prevRequestBody) {
@@ -478,10 +818,18 @@ function formatPrompt(requestBody, prevRequestBody) {
             const lastLine = [...lines].reverse().find(l => /^\s*\d+→/.test(l))
             const lastMatch = lastLine ? lastLine.match(/^\s*(\d+)→/) : null
             toolResults[b.tool_use_id] = `${lines.length} lines, L1-${lastMatch ? lastMatch[1] : '?'}`
-          } else if (content.length > 200) {
-            toolResults[b.tool_use_id] = `${content.length} chars`
           } else {
-            toolResults[b.tool_use_id] = content.slice(0, 100)
+            // Check if it looks like file paths (Glob/Grep results)
+            const pathLines = lines.filter(l => l.trim().startsWith('/') || l.includes('/'))
+            if (pathLines.length > 0) {
+              const shortPaths = pathLines.slice(0, 8).map(p => p.trim().split('/').slice(-2).join('/'))
+              const suffix = pathLines.length > 8 ? ` +${pathLines.length - 8} more` : ''
+              toolResults[b.tool_use_id] = `${pathLines.length} files: ${shortPaths.join(', ')}${suffix}`
+            } else if (content.length > 200) {
+              toolResults[b.tool_use_id] = `${content.length} chars`
+            } else {
+              toolResults[b.tool_use_id] = content.slice(0, 150)
+            }
           }
         }
       }
@@ -521,10 +869,21 @@ function formatPrompt(requestBody, prevRequestBody) {
             lines.push(`[Edit: ${short}]`)
           } else if (name === 'Write' && short) {
             lines.push(`[Write: ${short}]`)
+          } else if (name === 'Glob') {
+            const pattern = input.pattern || '*'
+            const dir = path ? path.split('/').slice(-2).join('/') : '.'
+            const result = toolResults[b.id] || ''
+            lines.push(`[Glob: ${dir}/${pattern}${result ? ` → ${result}` : ''}]`)
+          } else if (name === 'Grep') {
+            const pattern = input.pattern || ''
+            const dir = path ? path.split('/').slice(-2).join('/') : '.'
+            const result = toolResults[b.id] || ''
+            lines.push(`[Grep: "${pattern}" in ${dir}${result ? ` → ${result}` : ''}]`)
           } else if (short) {
             lines.push(`[${name}: ${short}]`)
           } else {
-            lines.push(`[${name}]`)
+            const result = toolResults[b.id] || ''
+            lines.push(`[${name}${result ? `: ${result}` : ''}]`)
           }
         } else if (b.type === 'tool_result') {
           continue
@@ -1539,44 +1898,26 @@ async function loadDetail(id) {
   const totalMessages = currentMessages.length
 
   if (req.session_id) {
-    // Fetch all requests for this session directly from API (not relying on filtered requests list)
+    // Fetch session request list (summary only, no full bodies — lightweight)
     const sessionReqs = await getRequests(req.session_id, { limit: 500 })
-
-    // Sort by timestamp ascending (oldest first)
     const sorted = [...sessionReqs].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
-
-    // Find the current request's position
     const curIdx = sorted.findIndex(r => r.id === id)
 
-    // Walk through each request up to current to build timestamp map
-    let prevCount = 0
-    for (let si = 0; si <= curIdx && si < sorted.length; si++) {
-      const sr = sorted[si]
-      let detail, msgCount
-      if (sr.id === id) {
-        msgCount = totalMessages
-        detail = req
-      } else {
-        try {
-          detail = await getRequestDetail(sr.id)
-          const body = JSON.parse(detail.request_body)
-          msgCount = (body.messages || []).length
-        } catch { continue }
-      }
-      for (let i = prevCount; i < msgCount; i++) {
-        msgTimestamps[i] = detail.timestamp
-      }
-      prevCount = msgCount
-    }
-
-    // prevMessageCount = messages from the request just before this one
+    // Use current request's message count to estimate prevMessageCount
+    // Only fetch the immediately previous request's detail (not all of them)
     if (curIdx > 0) {
-      const prevReq = sorted[curIdx - 1]
       try {
-        const prevDetail = await getRequestDetail(prevReq.id)
+        const prevDetail = await getRequestDetail(sorted[curIdx - 1].id)
         const prevBody = JSON.parse(prevDetail.request_body)
         prevMessageCount = (prevBody.messages || []).length
       } catch {}
+    }
+
+    // Simple timestamp assignment: current request's timestamp for new messages
+    for (let i = 0; i < totalMessages; i++) {
+      msgTimestamps[i] = i < prevMessageCount && curIdx > 0
+        ? sorted[curIdx - 1].timestamp
+        : req.timestamp
     }
   }
 
@@ -1607,14 +1948,16 @@ async function init() {
   await loadSessions()
   await loadRequests()
 
+  let sseRefreshTimer = null
   connectEvents((e) => {
-    loadSessions()
-    loadRequests()
+    // Debounce session/request list refresh (500ms)
+    clearTimeout(sseRefreshTimer)
+    sseRefreshTimer = setTimeout(() => { loadSessions(); loadRequests() }, 500)
 
     let eventRequestId = null
     try { eventRequestId = JSON.parse(e.data)?.data?.id } catch (_) {}
 
-    // Auto-select intercepted requests
+    // Auto-select intercepted requests (immediate, no debounce)
     if (e.type === 'request_intercepted' && eventRequestId) {
       selectedRequest = eventRequestId
       loadDetail(selectedRequest)
@@ -1624,7 +1967,7 @@ async function init() {
     if (selectedRequest && eventRequestId === selectedRequest) {
       loadDetail(selectedRequest)
     }
-    // Auto-refresh supervisor panel if open (debounced to avoid flicker)
+    // Auto-refresh supervisor panel if open (debounced)
     if (supervisorSessionId) {
       debouncedSupervisorRefresh(supervisorSessionId)
     }

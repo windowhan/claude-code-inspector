@@ -1,5 +1,6 @@
 mod db;
 mod dashboard;
+mod functions;
 mod intercept;
 mod mcp;
 mod proxy;

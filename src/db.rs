@@ -40,6 +40,21 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             classifier_prompt     TEXT NOT NULL DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS summarizer_config (
+            id                    INTEGER PRIMARY KEY DEFAULT 1,
+            provider              TEXT NOT NULL DEFAULT 'anthropic',
+            base_url              TEXT NOT NULL DEFAULT 'https://api.anthropic.com',
+            api_key               TEXT NOT NULL DEFAULT '',
+            model                 TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001',
+            language              TEXT NOT NULL DEFAULT 'English'
+        );
+
+        CREATE TABLE IF NOT EXISTS model_cache (
+            id TEXT PRIMARY KEY,
+            models TEXT NOT NULL,
+            cached_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS routing_rules (
             id             TEXT PRIMARY KEY,
             priority       INTEGER NOT NULL DEFAULT 100,
@@ -101,6 +116,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE requests ADD COLUMN routed_to_url TEXT NOT NULL DEFAULT ''", [],
+    );
+    // Migration: add provider and language columns to summarizer_config
+    let _ = conn.execute(
+        "ALTER TABLE summarizer_config ADD COLUMN provider TEXT NOT NULL DEFAULT 'anthropic'", [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE summarizer_config ADD COLUMN language TEXT NOT NULL DEFAULT 'English'", [],
     );
     // Migration: add read_range column to file_access
     let _ = conn.execute(
@@ -556,6 +578,49 @@ pub fn reorder_routing_rules(conn: &Connection, ids: &[String]) -> Result<()> {
             params![(i + 1) as i64, id],
         )?;
     }
+    Ok(())
+}
+
+// ── Summarizer config ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SummarizerConfig {
+    pub provider: String,   // "anthropic", "openai", "deepseek", "kimi"
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub language: String,
+}
+
+pub fn get_summarizer_config(conn: &Connection) -> Result<SummarizerConfig> {
+    let mut stmt = conn.prepare(
+        "SELECT provider, base_url, api_key, model, language FROM summarizer_config WHERE id = 1"
+    )?;
+    match stmt.query_row([], |row| {
+        Ok(SummarizerConfig {
+            provider: row.get(0)?,
+            base_url: row.get(1)?,
+            api_key: row.get(2)?,
+            model: row.get(3)?,
+            language: row.get::<_, String>(4).unwrap_or_else(|_| "English".to_string()),
+        })
+    }) {
+        Ok(c) => Ok(c),
+        Err(_) => Ok(SummarizerConfig {
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: String::new(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+            language: "English".to_string(),
+        }),
+    }
+}
+
+pub fn save_summarizer_config(conn: &Connection, config: &SummarizerConfig) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO summarizer_config (id, provider, base_url, api_key, model, language) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![config.provider, config.base_url, config.api_key, config.model, config.language],
+    )?;
     Ok(())
 }
 
