@@ -533,7 +533,8 @@ pre.resp-code { max-height: none; }
 .settings-btn:hover { background: var(--bg); color: var(--text-bright); }
 .cv-summarize-btn { margin-left: 8px; font-size: 10px; }
 .cv-summary-result { padding: 10px 12px; border-bottom: 1px solid var(--border); background: #1a2b1f; }
-.cv-summary-label { font-size: 10px; font-weight: 700; color: var(--green); text-transform: uppercase; margin-bottom: 4px; }
+.cv-summary-label { font-size: 10px; font-weight: 700; color: var(--green); text-transform: uppercase; margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+.cv-summary-refresh { font-size: 9px; padding: 1px 6px; }
 .cv-resize-handle { width: 4px; cursor: col-resize; background: var(--border); flex-shrink: 0; transition: background .15s; }
 .cv-resize-handle:hover { background: var(--blue); }
 .cv-loading, .cv-empty { padding: 20px; text-align: center; color: var(--text-muted); font-size: 12px; }

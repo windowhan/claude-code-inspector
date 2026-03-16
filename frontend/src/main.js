@@ -767,12 +767,18 @@ function renderTimeline(lineNum, requests) {
           sumBtn.textContent = 'Error'
           sumBtn.title = result.error
         } else {
-          // Insert summary at top of timeline
+          // Insert summary at top of timeline (remove old one if exists)
+          const old = $timeline.querySelector('.cv-summary-result')
+          if (old) old.remove()
           const summaryDiv = document.createElement('div')
           summaryDiv.className = 'cv-summary-result'
-          summaryDiv.innerHTML = `<div class="cv-summary-label">AI Summary</div><pre class="cv-req-pre">${esc(result.summary)}</pre>`
+          summaryDiv.innerHTML = `<div class="cv-summary-label">AI Summary <button class="btn btn-sm cv-summary-refresh" id="cvSummaryRefresh">Refresh</button></div><pre class="cv-req-pre">${esc(result.summary)}</pre>`
           $timeline.querySelector('.cv-timeline-header').after(summaryDiv)
           sumBtn.textContent = 'Summarize'
+          // Refresh button re-triggers summarize
+          document.getElementById('cvSummaryRefresh').addEventListener('click', () => {
+            sumBtn.click()
+          })
         }
       } catch (e) {
         sumBtn.textContent = 'Error'
