@@ -10,6 +10,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::db;
+use crate::functions;
 use crate::intercept;
 use crate::routing;
 use crate::supervisor;
@@ -111,6 +112,11 @@ pub async fn handle_dashboard(
             let sid = p.trim_start_matches("/api/supervisor/patterns/");
             full_to_box(serve_supervisor_patterns(&state, sid).await)
         }
+        // Summarizer API
+        ("GET", "/api/summarizer/config") => full_to_box(serve_summarizer_config_get(&state).await),
+        ("POST", "/api/summarizer/config") => full_to_box(serve_summarizer_config_save(&state, request_body.as_deref().unwrap_or(&[])).await),
+        ("POST", "/api/summarize") => full_to_box(serve_summarize(&state, request_body.as_deref().unwrap_or(&[])).await),
+        ("POST", "/api/summarizer/models") => full_to_box(serve_summarizer_models(&state, request_body.as_deref().unwrap_or(&[])).await),
         // Files API (Code Viewer)
         ("GET", p) if p.starts_with("/api/files/tree/") => {
             let sid = p.trim_start_matches("/api/files/tree/");
@@ -592,59 +598,57 @@ async fn serve_supervisor_coverage(state: &AppState, session_id: &str) -> Respon
                     }
                 }
             }
-            // Enrich each file with total_lines from disk and lines_read calculation
-            const DEFAULT_READ_LIMIT: i64 = 2000;
+            // Enrich with exact line-level coverage using a bitset approach
+            const DEFAULT_READ_LIMIT: usize = 2000;
             let mut files: Vec<serde_json::Value> = file_map.into_values().collect();
             for f in &mut files {
                 let path = f["file_path"].as_str().unwrap_or("");
-                // Count total lines from disk
                 let total_lines = std::fs::read_to_string(path)
-                    .map(|c| c.lines().count() as i64)
-                    .unwrap_or(-1);  // -1 = file not found or unreadable
-                f["total_lines"] = serde_json::json!(total_lines);
+                    .map(|c| c.lines().count())
+                    .unwrap_or(0);
+                f["total_lines"] = serde_json::json!(total_lines as i64);
 
-                // Calculate lines_read and has_full_read from read_ranges + total_lines
-                let mut lines_read: i64 = 0;
-                let mut is_full = false;
+                if total_lines == 0 {
+                    f["has_full_read"] = serde_json::json!(false);
+                    f["lines_read"] = serde_json::json!(0);
+                    continue;
+                }
+
+                // Build a covered-lines bitset from all read ranges
+                let mut covered = vec![false; total_lines];
 
                 if let Some(ranges) = f["read_ranges"].as_array() {
                     for r in ranges {
                         if let Some(s) = r.as_str() {
-                            if s == "default" {
-                                // No offset/limit = reads up to DEFAULT_READ_LIMIT lines
-                                if total_lines > 0 && total_lines <= DEFAULT_READ_LIMIT {
-                                    // File fits within default limit → truly full read
-                                    lines_read = total_lines;
-                                    is_full = true;
-                                } else if total_lines > DEFAULT_READ_LIMIT {
-                                    // File exceeds default limit → partial
-                                    lines_read = DEFAULT_READ_LIMIT;
-                                } else {
-                                    // File not found on disk, assume default limit
-                                    lines_read = DEFAULT_READ_LIMIT;
-                                }
+                            let (start, end) = if s == "default" {
+                                // Default read: lines 1..min(total, 2000)
+                                (0usize, total_lines.min(DEFAULT_READ_LIMIT))
                             } else {
-                                // Parse "offset:N,limit:M" or "limit:M"
-                                let mut limit_val: i64 = 0;
+                                // Parse "offset:N,limit:M"
+                                let mut offset_val: usize = 0;
+                                let mut limit_val: usize = total_lines;
                                 for part in s.split(',') {
+                                    if let Some(v) = part.strip_prefix("offset:") {
+                                        offset_val = v.parse().unwrap_or(0);
+                                    }
                                     if let Some(v) = part.strip_prefix("limit:") {
-                                        limit_val = v.parse().unwrap_or(0);
+                                        limit_val = v.parse().unwrap_or(total_lines);
                                     }
                                 }
-                                lines_read += limit_val;
+                                (offset_val, (offset_val + limit_val).min(total_lines))
+                            };
+                            for i in start..end {
+                                covered[i] = true;
                             }
                         }
                     }
                 }
 
-                // Cap lines_read to total_lines
-                if total_lines > 0 && lines_read >= total_lines {
-                    lines_read = total_lines;
-                    is_full = true;
-                }
+                let lines_read = covered.iter().filter(|&&c| c).count();
+                let is_full = lines_read == total_lines;
 
                 f["has_full_read"] = serde_json::json!(is_full);
-                f["lines_read"] = serde_json::json!(lines_read);
+                f["lines_read"] = serde_json::json!(lines_read as i64);
             }
             let result = serde_json::json!({
                 "file_count": files.len(),
@@ -677,6 +681,335 @@ async fn serve_supervisor_patterns(state: &AppState, session_id: &str) -> Respon
     let text = serde_json::to_string(&result).unwrap_or_default();
     let _ = db::set_supervisor_cache(&db, session_id, "detect_patterns", req_count, pending_count, &text);
     json_response(result)
+}
+
+// ── Summarizer API handlers ───────────────────────────────────────────────────
+
+async fn serve_summarizer_config_get(state: &AppState) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    match db::get_summarizer_config(&db) {
+        Ok(config) => json_response(serde_json::json!({
+            "provider": config.provider,
+            "base_url": config.base_url,
+            "api_key": config.api_key,
+            "model": config.model,
+            "language": config.language,
+            "configured": !config.api_key.is_empty(),
+        })),
+        Err(e) => json_error(&e.to_string()),
+    }
+}
+
+async fn serve_summarizer_config_save(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error("Invalid JSON"),
+    };
+    let db = state.db.lock().await;
+    let mut config = db::get_summarizer_config(&db).unwrap_or_else(|_| db::SummarizerConfig {
+        provider: "anthropic".to_string(),
+        base_url: "https://api.anthropic.com".to_string(),
+        api_key: String::new(),
+        model: "claude-haiku-4-5-20251001".to_string(),
+        language: "English".to_string(),
+    });
+    if let Some(p) = val.get("provider").and_then(|v| v.as_str()) { config.provider = p.to_string(); }
+    if let Some(u) = val.get("base_url").and_then(|v| v.as_str()) { config.base_url = u.to_string(); }
+    if let Some(k) = val.get("api_key").and_then(|v| v.as_str()) { config.api_key = k.to_string(); }
+    if let Some(m) = val.get("model").and_then(|v| v.as_str()) { config.model = m.to_string(); }
+    if let Some(l) = val.get("language").and_then(|v| v.as_str()) { config.language = l.to_string(); }
+    match db::save_summarizer_config(&db, &config) {
+        Ok(_) => json_response(serde_json::json!({"ok": true})),
+        Err(e) => json_error(&e.to_string()),
+    }
+}
+
+async fn serve_summarize(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error("Invalid JSON"),
+    };
+
+    let config = {
+        let db = state.db.lock().await;
+        db::get_summarizer_config(&db).unwrap_or_else(|_| db::SummarizerConfig {
+            provider: String::new(),
+            base_url: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            language: "English".to_string(),
+        })
+    };
+
+    if config.api_key.is_empty() {
+        return json_error("Summarizer not configured. Set API key in ⚙ Settings.");
+    }
+
+    let line = val.get("line").and_then(|v| v.as_i64()).unwrap_or(0);
+    let requests = val.get("requests").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    // Build compact prompt from request data
+    let mut context = format!("Summarize what happened to line {} across these {} LLM requests. Focus on: what was the goal, what tools were used (with full file paths), what was the outcome. Respond in {}.\n\n", line, requests.len(), config.language);
+    for (i, r) in requests.iter().enumerate() {
+        let agent = r.get("agent_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let access = r.get("access_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let range = r.get("read_range").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = r.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        let req_id = r.get("request_id").and_then(|v| v.as_str()).unwrap_or("?");
+
+        // Extract file paths from tool_use blocks (full paths, not truncated)
+        let req_body = r.get("request_body").and_then(|v| v.as_str()).unwrap_or("");
+        let file_paths = extract_tool_file_paths(req_body);
+
+        // Extract last user message as the prompt
+        let prompt_text = extract_last_user_text(req_body);
+
+        // Extract response summary
+        let resp_body = r.get("response_body").and_then(|v| v.as_str()).unwrap_or("");
+        let resp_text = extract_response_text(resp_body);
+
+        context.push_str(&format!("--- Request {} (id:{} {} {} {} {}) ---\nFiles accessed: {}\nPrompt: {}\nResponse: {}\n\n",
+            i + 1, &req_id[..req_id.len().min(8)], ts, agent, access, range,
+            if file_paths.is_empty() { "none".to_string() } else { file_paths.join(", ") },
+            prompt_text,
+            resp_text,
+        ));
+    }
+
+    // Call LLM with provider-specific format
+    let client = reqwest::Client::new();
+    let is_anthropic = config.provider == "anthropic";
+    // OpenAI-compatible: openai, deepseek, kimi
+    // Anthropic: anthropic
+
+    let (url, api_body, auth_header) = if is_anthropic {
+        (
+            format!("{}/v1/messages", config.base_url),
+            serde_json::json!({
+                "model": config.model,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": context}],
+            }),
+            ("x-api-key", config.api_key.clone()),
+        )
+    } else {
+        // OpenAI-compatible format (deepseek, openai, kimi)
+        let path = if config.provider == "kimi" {
+            format!("{}/v1/chat/completions", config.base_url)
+        } else {
+            format!("{}/v1/chat/completions", config.base_url)
+        };
+        (
+            path,
+            serde_json::json!({
+                "model": config.model,
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": context}],
+            }),
+            ("authorization", format!("Bearer {}", config.api_key)),
+        )
+    };
+
+    let mut req_builder = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .header(auth_header.0, &auth_header.1);
+
+    if is_anthropic {
+        req_builder = req_builder.header("anthropic-version", "2023-06-01");
+    }
+
+    let resp: reqwest::Response = match req_builder
+        .body(serde_json::to_string(&api_body).unwrap_or_default())
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return json_error(&format!("LLM request failed: {e}")),
+    };
+
+    let resp_text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => return json_error(&format!("LLM response read failed: {e}")),
+    };
+    let resp_json: serde_json::Value = match serde_json::from_str(&resp_text) {
+        Ok(j) => j,
+        Err(e) => return json_error(&format!("LLM response parse failed: {e} — raw: {}", truncate(&resp_text, 200))),
+    };
+
+    // Parse response based on provider format
+    let summary = if is_anthropic {
+        // Anthropic: { content: [{ text: "..." }] }
+        resp_json.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|b| b.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("No summary generated")
+    } else {
+        // OpenAI-compatible: { choices: [{ message: { content: "..." } }] }
+        resp_json.get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("No summary generated")
+    };
+
+    json_response(serde_json::json!({"summary": summary}))
+}
+
+async fn serve_summarizer_models(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+    let provider = val.get("provider").and_then(|v| v.as_str()).unwrap_or("anthropic");
+    let base_url = val.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+    let api_key = val.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+
+    let actual_key = if api_key.is_empty() {
+        let db = state.db.lock().await;
+        db::get_summarizer_config(&db).map(|c| c.api_key).unwrap_or_default()
+    } else {
+        api_key.to_string()
+    };
+
+    if actual_key.is_empty() {
+        return json_error("API key required to fetch models");
+    }
+
+    let cache_id = format!("{}:{}", provider, base_url);
+
+    // Check 1-day cache
+    {
+        let db = state.db.lock().await;
+        let cached: Option<(String, String)> = db.query_row(
+            "SELECT models, cached_at FROM model_cache WHERE id = ?1",
+            rusqlite::params![cache_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).ok();
+        if let Some((models_json, cached_at)) = cached {
+            if let Ok(cached_time) = chrono::DateTime::parse_from_rfc3339(&cached_at) {
+                let age = chrono::Utc::now().signed_duration_since(cached_time);
+                if age.num_hours() < 24 {
+                    if let Ok(models) = serde_json::from_str::<Vec<String>>(&models_json) {
+                        return json_response(serde_json::json!({ "models": models, "cached": true }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fetch from provider
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/models", base_url);
+
+    let mut req = client.get(&url).header("content-type", "application/json");
+    if provider == "anthropic" {
+        req = req.header("x-api-key", &actual_key).header("anthropic-version", "2023-06-01");
+    } else {
+        req = req.header("authorization", format!("Bearer {}", actual_key));
+    }
+
+    let resp: reqwest::Response = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return json_error(&format!("Failed to fetch models: {e}")),
+    };
+
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => return json_error(&format!("Failed to read response: {e}")),
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(j) => j,
+        Err(_) => return json_error("Invalid response from provider"),
+    };
+
+    let mut models: Vec<String> = json.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+    models.sort();
+
+    // Cache for 1 day
+    if !models.is_empty() {
+        let db = state.db.lock().await;
+        let now = chrono::Utc::now().to_rfc3339();
+        let models_json = serde_json::to_string(&models).unwrap_or_default();
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO model_cache (id, models, cached_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![cache_id, models_json, now],
+        );
+    }
+
+    json_response(serde_json::json!({ "models": models, "cached": false }))
+}
+
+fn extract_tool_file_paths(request_body: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(request_body) {
+        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+            for m in msgs {
+                if m.get("role").and_then(|r| r.as_str()) != Some("assistant") { continue; }
+                if let Some(content) = m.get("content").and_then(|c| c.as_array()) {
+                    for b in content {
+                        if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") { continue; }
+                        let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        if !matches!(name, "Read" | "Write" | "Edit" | "Grep" | "Glob") { continue; }
+                        let input = b.get("input").unwrap_or(&serde_json::Value::Null);
+                        if let Some(p) = input.get("file_path").or(input.get("path")).and_then(|v| v.as_str()) {
+                            if !p.is_empty() && !paths.contains(&p.to_string()) {
+                                paths.push(p.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn extract_last_user_text(request_body: &str) -> String {
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(request_body) {
+        if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+            for m in msgs.iter().rev() {
+                if m.get("role").and_then(|r| r.as_str()) != Some("user") { continue; }
+                if let Some(s) = m.get("content").and_then(|c| c.as_str()) {
+                    if !s.starts_with("<system-reminder>") { return s.to_string(); }
+                }
+                if let Some(arr) = m.get("content").and_then(|c| c.as_array()) {
+                    for b in arr.iter().rev() {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            if !t.starts_with("<system-reminder>") { return t.to_string(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn extract_response_text(response_body: &str) -> String {
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(response_body) {
+        if let Some(acc) = body.get("accumulated_content").and_then(|v| v.as_str()) {
+            return acc.to_string();
+        }
+        if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
+            return content.iter()
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    String::new()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
 }
 
 // ── Files API handlers (Code Viewer) ─────────────────────────────────────────
@@ -743,10 +1076,15 @@ async fn serve_file_tree(state: &AppState, session_id: &str) -> Response<Full<By
                     "children": walk_dir(&path, depth + 1),
                 }));
             } else {
+                // Count lines for text files (skip binary/large files)
+                let line_count = std::fs::read_to_string(&path)
+                    .map(|c| c.lines().count() as i64)
+                    .unwrap_or(-1);
                 entries.push(serde_json::json!({
                     "name": name,
                     "path": path.to_string_lossy(),
                     "type": "file",
+                    "total_lines": line_count,
                 }));
             }
         }
@@ -778,10 +1116,15 @@ async fn serve_file_content(state: &AppState, session_id: &str, query: &str) -> 
     match std::fs::read_to_string(&canon) {
         Ok(content) => {
             let lines: Vec<&str> = content.lines().collect();
+            let path_str = canon.to_string_lossy().to_string();
+            let funcs = functions::extract_functions(&path_str, &content);
+            let lang = functions::detect_language(&path_str);
             json_response(serde_json::json!({
-                "path": canon.to_string_lossy(),
+                "path": path_str,
                 "lines": lines,
                 "total_lines": lines.len(),
+                "language": lang,
+                "functions": funcs,
             }))
         }
         Err(_) => json_error("Cannot read file (binary or inaccessible)"),
