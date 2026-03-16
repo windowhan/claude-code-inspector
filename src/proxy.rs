@@ -397,7 +397,7 @@ async fn handle_inner(
         let state_clone = Arc::clone(&state);
         let request_id_clone = request_id.clone();
         let session_id_clone = session_id.clone();
-        let body_str_clone = body_str.clone();
+
         let timestamp_clone = timestamp.clone();
         let project_name = session_info.project_name.clone();
         let resp_headers_json = serde_json::to_string(&resp_log_headers).unwrap_or_default();
@@ -428,9 +428,9 @@ async fn handle_inner(
                     ) {
                         warn!("Failed to update SSE request: {e}");
                     }
-                    // Extract and store file accesses
+                    // Extract and store file accesses from SSE response (not request body)
                     {
-                        let accesses = supervisor::extract_file_accesses(&body_str_clone);
+                        let accesses = supervisor::extract_file_accesses_from_sse(&raw_bytes);
                         for (path, atype, range) in &accesses {
                             let _ = db::insert_file_access(&db, &session_id_clone, &request_id_clone, path, atype, range, &timestamp_clone);
                         }
@@ -510,9 +510,9 @@ async fn handle_inner(
                 warn!("Failed to update request: {e}");
             }
 
-            // Extract and store file accesses
+            // Extract and store file accesses from response JSON (not request body)
             {
-                let accesses = supervisor::extract_file_accesses(&body_str);
+                let accesses = supervisor::extract_file_accesses_from_response(&resp_body_str);
                 for (path, atype, range) in &accesses {
                     let _ = db::insert_file_access(&db, &session_id, &request_id, path, atype, range, &timestamp);
                 }
