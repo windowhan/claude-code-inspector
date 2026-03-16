@@ -8,14 +8,102 @@ use crate::types::RequestRecord;
 
 // ── File access parsing ──────────────────────────────────────────────────────
 
-/// Extract file accesses from request_body by parsing tool_use blocks in assistant messages.
-///
-/// Only parses tool_use blocks (role=assistant) with names: Read, Write, Edit, Grep, Glob.
-/// Does NOT parse tool_result blocks or response_body (v1 limitation).
-/// Does NOT track Bash tool file access (shell commands are opaque).
-/// Each access: (file_path, access_type, read_range)
-/// read_range is "full" for full reads, "offset:N,limit:M" for partial, "" for non-read ops
-pub fn extract_file_accesses(request_body: &str) -> Vec<(String, String, String)> {
+/// Shared helper: derive (file_path, access_type, read_range) from a tool_use name + input.
+fn file_access_from_tool_use(name: &str, input: &Value) -> Option<(String, String, String)> {
+    let access_type = match name {
+        "Read" => "read",
+        "Write" => "write",
+        "Edit" => "edit",
+        "Grep" | "Glob" => "search",
+        _ => return None,
+    };
+    let file_path = input
+        .get("file_path")
+        .or_else(|| input.get("path"))
+        .and_then(|p| p.as_str())?;
+    if file_path.is_empty() {
+        return None;
+    }
+    let read_range = if access_type == "read" {
+        let offset = input.get("offset").and_then(|v| v.as_i64());
+        let limit  = input.get("limit").and_then(|v| v.as_i64());
+        match (offset, limit) {
+            (None, None)       => "full".to_string(),
+            (Some(o), Some(l)) => format!("offset:{o},limit:{l}"),
+            (Some(o), None)    => format!("offset:{o}"),
+            (None, Some(l))    => format!("limit:{l}"),
+        }
+    } else {
+        String::new()
+    };
+    Some((file_path.to_string(), access_type.to_string(), read_range))
+}
+
+/// Extract file accesses from a raw Anthropic SSE response.
+/// Parses only the tool_use content blocks that Claude generated in THIS response turn,
+/// so each access is correctly attributed to the specific request that produced it.
+pub fn extract_file_accesses_from_sse(raw_sse: &[u8]) -> Vec<(String, String, String)> {
+    let text = String::from_utf8_lossy(raw_sse);
+    // index → (tool_name, accumulated_input_json)
+    let mut tool_blocks: std::collections::HashMap<u64, (String, String)> = std::collections::HashMap::new();
+
+    for line in text.lines() {
+        let Some(json_str) = line.strip_prefix("data: ") else { continue };
+        let Ok(json) = serde_json::from_str::<Value>(json_str) else { continue };
+
+        match json.get("type").and_then(|t| t.as_str()) {
+            Some("content_block_start") => {
+                let Some(idx) = json.get("index").and_then(|i| i.as_u64()) else { continue };
+                let Some(block) = json.get("content_block") else { continue };
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") { continue }
+                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                tool_blocks.insert(idx, (name, String::new()));
+            }
+            Some("content_block_delta") => {
+                let Some(idx) = json.get("index").and_then(|i| i.as_u64()) else { continue };
+                let Some(delta) = json.get("delta") else { continue };
+                if delta.get("type").and_then(|t| t.as_str()) != Some("input_json_delta") { continue }
+                let Some(partial) = delta.get("partial_json").and_then(|p| p.as_str()) else { continue };
+                if let Some(entry) = tool_blocks.get_mut(&idx) {
+                    entry.1.push_str(partial);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut accesses = Vec::new();
+    for (_, (name, input_json)) in &tool_blocks {
+        if input_json.is_empty() { continue }
+        let Ok(input) = serde_json::from_str::<Value>(input_json) else { continue };
+        if let Some(acc) = file_access_from_tool_use(name, &input) {
+            accesses.push(acc);
+        }
+    }
+    accesses
+}
+
+/// Extract file accesses from a non-streaming Anthropic response JSON body.
+pub fn extract_file_accesses_from_response(resp_body: &str) -> Vec<(String, String, String)> {
+    let Ok(body) = serde_json::from_str::<Value>(resp_body) else { return Vec::new() };
+    let Some(content) = body.get("content").and_then(|c| c.as_array()) else { return Vec::new() };
+    let mut accesses = Vec::new();
+    for block in content {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") { continue }
+        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        let Some(input) = block.get("input") else { continue };
+        if let Some(acc) = file_access_from_tool_use(name, input) {
+            accesses.push(acc);
+        }
+    }
+    accesses
+}
+
+/// Extract file accesses from request_body.
+/// NOTE: This iterates ALL accumulated messages — only use in tests.
+/// For production use extract_file_accesses_from_sse / extract_file_accesses_from_response.
+#[cfg(test)]
+fn extract_file_accesses(request_body: &str) -> Vec<(String, String, String)> {
     let mut accesses = Vec::new();
 
     let body: Value = match serde_json::from_str(request_body) {
@@ -135,8 +223,8 @@ pub fn build_session_summary(requests: &[RequestRecord]) -> Value {
                 .and_then(|b| b.get("model").and_then(|m| m.as_str()).map(|s| s.to_string()))
                 .unwrap_or_default();
 
-            // Count tool_use blocks in request_body (assistant messages)
-            let tool_calls = count_tool_calls(&r.request_body);
+            // Count tool_use blocks from response (accurate per-request attribution)
+            let tool_calls = count_tool_calls(r.response_body.as_deref().unwrap_or(""));
 
             json!({
                 "request_id": r.id,
@@ -165,22 +253,31 @@ pub fn build_session_summary(requests: &[RequestRecord]) -> Value {
     })
 }
 
-fn count_tool_calls(request_body: &str) -> Value {
+fn count_tool_calls(response_body: &str) -> Value {
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
-    if let Ok(body) = serde_json::from_str::<Value>(request_body) {
-        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            for msg in messages {
-                if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-                    continue;
-                }
-                if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
-                    for block in content {
+    if let Ok(body) = serde_json::from_str::<Value>(response_body) {
+        // SSE response: {"accumulated_content": "...", "raw_sse": "..."}
+        if let Some(raw_sse) = body.get("raw_sse").and_then(|v| v.as_str()) {
+            for line in raw_sse.lines() {
+                let Some(json_str) = line.strip_prefix("data: ") else { continue };
+                let Ok(json) = serde_json::from_str::<Value>(json_str) else { continue };
+                if json.get("type").and_then(|t| t.as_str()) == Some("content_block_start") {
+                    if let Some(block) = json.get("content_block") {
                         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                             if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                 *counts.entry(name.to_string()).or_insert(0) += 1;
                             }
                         }
+                    }
+                }
+            }
+        } else if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
+            // Non-streaming response: {"content": [...]}
+            for block in content {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                        *counts.entry(name.to_string()).or_insert(0) += 1;
                     }
                 }
             }

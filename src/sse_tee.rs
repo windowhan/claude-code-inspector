@@ -70,6 +70,7 @@ impl Drop for SseTeeStream {
 pub fn parse_sse_content(data: &[u8]) -> (String, Option<i64>, Option<i64>) {
     let text = String::from_utf8_lossy(data);
     let mut content = String::new();
+    let mut tool_calls: Vec<String> = Vec::new();
     let mut input_tokens: Option<i64> = None;
     let mut output_tokens: Option<i64> = None;
 
@@ -96,6 +97,16 @@ pub fn parse_sse_content(data: &[u8]) -> (String, Option<i64>, Option<i64>) {
 
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data_line) {
             match event_type.as_str() {
+                "content_block_start" => {
+                    // Track tool_use block names for display when no text content
+                    if let Some(block) = json.get("content_block") {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                tool_calls.push(name.to_string());
+                            }
+                        }
+                    }
+                }
                 "content_block_delta" => {
                     if let Some(delta_text) = json
                         .get("delta")
@@ -133,6 +144,11 @@ pub fn parse_sse_content(data: &[u8]) -> (String, Option<i64>, Option<i64>) {
                 _ => {}
             }
         }
+    }
+
+    // When Claude only made tool calls with no text, summarise them for display
+    if content.is_empty() && !tool_calls.is_empty() {
+        content = format!("[Tool calls: {}]", tool_calls.join(", "));
     }
 
     (content, input_tokens, output_tokens)

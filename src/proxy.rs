@@ -397,7 +397,7 @@ async fn handle_inner(
         let state_clone = Arc::clone(&state);
         let request_id_clone = request_id.clone();
         let session_id_clone = session_id.clone();
-        let body_str_clone = body_str.clone();
+
         let timestamp_clone = timestamp.clone();
         let project_name = session_info.project_name.clone();
         let resp_headers_json = serde_json::to_string(&resp_log_headers).unwrap_or_default();
@@ -428,9 +428,9 @@ async fn handle_inner(
                     ) {
                         warn!("Failed to update SSE request: {e}");
                     }
-                    // Extract and store file accesses
+                    // Extract and store file accesses from SSE response (not request body)
                     {
-                        let accesses = supervisor::extract_file_accesses(&body_str_clone);
+                        let accesses = supervisor::extract_file_accesses_from_sse(&raw_bytes);
                         for (path, atype, range) in &accesses {
                             let _ = db::insert_file_access(&db, &session_id_clone, &request_id_clone, path, atype, range, &timestamp_clone);
                         }
@@ -510,9 +510,9 @@ async fn handle_inner(
                 warn!("Failed to update request: {e}");
             }
 
-            // Extract and store file accesses
+            // Extract and store file accesses from response JSON (not request body)
             {
-                let accesses = supervisor::extract_file_accesses(&body_str);
+                let accesses = supervisor::extract_file_accesses_from_response(&resp_body_str);
                 for (path, atype, range) in &accesses {
                     let _ = db::insert_file_access(&db, &session_id, &request_id, path, atype, range, &timestamp);
                 }
@@ -555,23 +555,29 @@ fn emit_event(state: &AppState, event_type: &str, data: serde_json::Value) {
 /// do NOT have this tool. Sub-agent type is then refined by looking at their
 /// specific system prompt content.
 fn detect_agent_type(body_str: &str) -> (String, String) {
-    // Main agent always has the Agent tool available
-    let has_agent_tool = body_str.contains("Launch a new agent to handle complex");
+    // Parse JSON and check only the `system` field to avoid false matches
+    // from agent-type keywords appearing in cumulative message history.
+    let system = serde_json::from_str::<serde_json::Value>(body_str)
+        .ok()
+        .and_then(|v| v.get("system").cloned())
+        .map(|s| if let Some(str_val) = s.as_str() { str_val.to_string() } else { s.to_string() })
+        .unwrap_or_default();
 
-    if has_agent_tool {
+    // Main agent always has the Agent tool available in its system prompt
+    if system.contains("Launch a new agent to handle complex") {
         return ("main".to_string(), String::new());
     }
 
-    // This is a sub-agent — determine which kind
-    let agent_type = if body_str.contains("Fast agent specialized for exploring") {
+    // This is a sub-agent — determine which kind from its system prompt
+    let agent_type = if system.contains("Fast agent specialized for exploring") {
         "explore"
-    } else if body_str.contains("Software architect agent for designing") {
+    } else if system.contains("Software architect agent for designing") {
         "plan"
-    } else if body_str.contains("Performs ultra-granular per-function deep analysis") {
+    } else if system.contains("Performs ultra-granular per-function deep analysis") {
         "audit"
-    } else if body_str.contains("configure the user's Claude Code status line") {
+    } else if system.contains("configure the user's Claude Code status line") {
         "statusline"
-    } else if body_str.contains("Claude Code (the CLI tool)") && body_str.contains("claude-code-guide") {
+    } else if system.contains("Claude Code (the CLI tool)") && system.contains("claude-code-guide") {
         "guide"
     } else {
         "sub"
