@@ -560,8 +560,10 @@ pre.resp-code { max-height: none; }
 .cv-line-touched { cursor: pointer; }
 .cv-linenum { display: inline-block; min-width: 44px; text-align: right; padding-right: 8px; color: var(--text-muted); user-select: none; flex-shrink: 0; }
 .cv-text { white-space: pre; color: var(--text); flex: 1; }
-.cv-annotation { margin-left: auto; flex-shrink: 0; font-size: 10px; font-family: monospace; padding: 0 8px; cursor: pointer; white-space: nowrap; opacity: 0.6; transition: opacity .15s; }
+.cv-annotation { margin-left: auto; flex-shrink: 0; font-size: 10px; font-family: monospace; padding: 0 8px; cursor: pointer; white-space: nowrap; opacity: 0.6; transition: opacity .15s; display: flex; gap: 4px; }
 .cv-annotation:hover, .cv-annotation.active { opacity: 1; }
+.cv-ann-tag { border-radius: 3px; padding: 0 3px; }
+.cv-ann-tag:hover { text-decoration: underline; }
 .cv-ann-read { color: var(--blue); }
 .cv-ann-edit { color: var(--yellow); }
 .cv-ann-search { color: var(--text-muted); }
