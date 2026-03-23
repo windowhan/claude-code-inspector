@@ -158,6 +158,19 @@ fn find_workspace_for_pid(pid: u32) -> Option<(String, String)> {
     Some((folder, project_name))
 }
 
+/// Derive a stable session_id from the workspace CWD.
+/// Falls back to pid-based ID when cwd is empty.
+fn workspace_session_id(cwd: &str, fallback_pid: u32) -> String {
+    if cwd.is_empty() {
+        return format!("cursor-{fallback_pid}");
+    }
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    cwd.hash(&mut h);
+    format!("cursor-{:016x}", h.finish())
+}
+
 /// Main watch loop — spawned as a background task.
 pub async fn watch(state: Arc<AppState>) {
     let mut ticker = interval(Duration::from_secs(POLL_INTERVAL_SECS));
@@ -185,19 +198,25 @@ pub async fn watch(state: Arc<AppState>) {
             continue;
         }
 
-        // Upsert workspace sessions for each Cursor PID; capture cwd for first pid
-        let mut primary_cwd = String::new();
-        for (i, &pid) in pids.iter().enumerate() {
+        // Collect unique workspaces across all PIDs (multiple Cursor processes share one workspace)
+        let mut workspaces: Vec<(String, String, u32)> = vec![]; // (cwd, project_name, first_pid)
+        for &pid in &pids {
             let (cwd, project_name) = find_workspace_for_pid(pid)
                 .unwrap_or_else(|| (String::new(), format!("Cursor (pid {pid})")));
-            if i == 0 {
-                primary_cwd = cwd.clone();
+            // Deduplicate by cwd — only keep first PID per workspace
+            if !workspaces.iter().any(|(w, _, _)| *w == cwd) {
+                workspaces.push((cwd, project_name, pid));
             }
+        }
+
+        // Upsert one session per unique workspace, using a stable cwd-based session_id
+        for (cwd, project_name, pid) in &workspaces {
+            let session_id = workspace_session_id(cwd, *pid);
             let session = SessionRecord {
-                id: format!("cursor-{pid}"),
-                pid: Some(pid as i64),
-                cwd: Some(cwd),
-                project_name: Some(project_name),
+                id: session_id.clone(),
+                pid: Some(*pid as i64),
+                cwd: Some(cwd.clone()),
+                project_name: Some(project_name.clone()),
                 started_at: Utc::now().to_rfc3339(),
                 last_seen_at: Utc::now().to_rfc3339(),
             };
@@ -206,6 +225,12 @@ pub async fn watch(state: Arc<AppState>) {
                 warn!("cursor_db: upsert_session failed: {e}");
             }
         }
+
+        // Use the first workspace's session_id and cwd for bubble attribution
+        let (primary_cwd, primary_session_id) = workspaces
+            .first()
+            .map(|(cwd, _, pid)| (cwd.clone(), workspace_session_id(cwd, *pid)))
+            .unwrap_or_else(|| (String::new(), "cursor-unknown".to_string()));
 
         // Fetch all bubble keys
         let rows = fetch_bubble_keys(&db_path);
@@ -241,11 +266,7 @@ pub async fn watch(state: Arc<AppState>) {
             continue;
         }
 
-        // Determine session_id: use first running cursor pid session, or "cursor-unknown"
-        let session_id = pids
-            .first()
-            .map(|p| format!("cursor-{p}"))
-            .unwrap_or_else(|| "cursor-unknown".to_string());
+        let session_id = primary_session_id;
 
         let db = state.db.lock().await;
 
