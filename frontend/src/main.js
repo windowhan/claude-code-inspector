@@ -1081,14 +1081,63 @@ function collapseBlock(block) {
 
 function formatResponse(responseBody) {
   if (!responseBody) return '(no response)'
+
+  // ── Cursor timeline format (JSON array) ──────────────────────────────────
+  try {
+    const arr = JSON.parse(responseBody)
+    if (Array.isArray(arr)) {
+      return arr.map(item => {
+        if (item.type === 'tool') {
+          const args = item.args || {}
+          const rawPath = args.path || args.file_path || ''
+          const filename = rawPath ? rawPath.split('/').pop() : (item.name || 'tool')
+          const offset = args.offset
+          const limit = args.limit
+          let lineInfo = ''
+          if (offset != null || limit != null) {
+            const s = (offset || 0) + 1
+            const e = limit ? s + limit - 1 : '?'
+            lineInfo = ` (line ${s}-${e})`
+          }
+          const sep = '─'.repeat(Math.max(0, 48 - filename.length - lineInfo.length))
+          return `┌─ ${filename}${lineInfo} ${sep}\n│  ${item.name || 'tool'} [${item.status || 'completed'}]\n└${'─'.repeat(50)}`
+        }
+        if (item.type === 'text') return item.content || ''
+        return JSON.stringify(item)
+      }).join('\n\n')
+    }
+  } catch {}
+
+  // ── Claude Code response format ───────────────────────────────────────────
   try {
     const body = JSON.parse(responseBody)
     if (body.accumulated_content) return body.accumulated_content
     if (body.content) {
-      if (Array.isArray(body.content)) {
-        return body.content.map(b => collapseBlock(b)).join('\n')
-      }
-      return typeof body.content === 'string' ? body.content : JSON.stringify(body.content, null, 2)
+      const blocks = Array.isArray(body.content) ? body.content : [{ type: 'text', text: String(body.content) }]
+      return blocks.map(b => {
+        if (b.type === 'tool_use') {
+          const input = b.input || {}
+          const rawPath = input.file_path || input.path || ''
+          const filename = rawPath ? rawPath.split('/').pop() : (b.name || 'tool')
+          const offset = input.offset
+          const limit = input.limit
+          let lineInfo = ''
+          if (offset != null || limit != null) {
+            const s = (offset || 0) + 1
+            const e = limit ? s + limit - 1 : '?'
+            lineInfo = ` (line ${s}-${e})`
+          }
+          const sep = '─'.repeat(Math.max(0, 48 - filename.length - lineInfo.length))
+          // Extra args beyond path/offset/limit
+          const extras = Object.entries(input)
+            .filter(([k]) => !['file_path','path','offset','limit'].includes(k))
+            .map(([k, v]) => `  ${k}: ${JSON.stringify(v)}`)
+            .join('\n')
+          return `┌─ ${filename}${lineInfo} ${sep}\n│  ${b.name || 'tool'}${extras ? '\n' + extras : ''}\n└${'─'.repeat(50)}`
+        }
+        if (b.type === 'text') return b.text || ''
+        return collapseBlock(b)
+      }).filter(Boolean).join('\n\n')
     }
     return JSON.stringify(body, null, 2).slice(0, 5000)
   } catch { return (responseBody || '').slice(0, 5000) }
