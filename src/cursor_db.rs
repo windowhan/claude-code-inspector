@@ -185,10 +185,14 @@ pub async fn watch(state: Arc<AppState>) {
             continue;
         }
 
-        // Upsert workspace sessions for each Cursor PID
-        for &pid in &pids {
+        // Upsert workspace sessions for each Cursor PID; capture cwd for first pid
+        let mut primary_cwd = String::new();
+        for (i, &pid) in pids.iter().enumerate() {
             let (cwd, project_name) = find_workspace_for_pid(pid)
                 .unwrap_or_else(|| (String::new(), format!("Cursor (pid {pid})")));
+            if i == 0 {
+                primary_cwd = cwd.clone();
+            }
             let session = SessionRecord {
                 id: format!("cursor-{pid}"),
                 pid: Some(pid as i64),
@@ -324,6 +328,40 @@ pub async fn watch(state: Arc<AppState>) {
                             .and_then(|v| v.as_str())
                             .unwrap_or("completed")
                             .to_string();
+                        // Record file access for tools that operate on files
+                        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+                            if let Some(user_bubbles) = conv_user_bubbles.get(&conversation_id) {
+                                if let Some(request_id) = user_bubbles.last() {
+                                    let read_range = {
+                                        let offset = args.get("offset").and_then(|v| v.as_i64());
+                                        let limit = args.get("limit").and_then(|v| v.as_i64());
+                                        match (offset, limit) {
+                                            (Some(o), Some(l)) => format!("offset:{o},limit:{l}"),
+                                            (Some(o), None) => format!("offset:{o}"),
+                                            _ => String::new(),
+                                        }
+                                    };
+                                    // Resolve relative paths to absolute using workspace CWD
+                                    let abs_path = if path.starts_with('/') {
+                                        path.to_string()
+                                    } else if !primary_cwd.is_empty() {
+                                        format!("{}/{}", primary_cwd.trim_end_matches('/'), path)
+                                    } else {
+                                        path.to_string()
+                                    };
+                                    let _ = db::insert_file_access(
+                                        &db,
+                                        &session_id,
+                                        request_id,
+                                        &abs_path,
+                                        "read",
+                                        &read_range,
+                                        &Utc::now().to_rfc3339(),
+                                    );
+                                }
+                            }
+                        }
+
                         conv_tool_calls
                             .entry(conversation_id.clone())
                             .or_default()
