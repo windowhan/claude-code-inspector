@@ -852,6 +852,7 @@ function renderTimeline(lineNum, requests) {
       <details class="cv-req-details"><summary>Prompt</summary><pre class="cv-req-pre">${esc(formatPrompt(r.request_body, prevReqBody))}</pre></details>
       <details class="cv-req-details"><summary>Raw Prompt</summary><pre class="cv-req-pre cv-req-raw">${esc(formatRawPrompt(r.request_body))}</pre></details>
       <details class="cv-req-details"><summary>Response</summary><pre class="cv-req-pre">${esc(formatResponse(r.response_body))}</pre></details>
+      <details class="cv-req-details"><summary>Raw Response</summary><pre class="cv-req-pre cv-req-raw">${esc(formatRawResponse(r.response_body))}</pre></details>
     </div>`
   }
   $timeline.innerHTML = html
@@ -1098,6 +1099,14 @@ function formatRawPrompt(requestBody) {
     const body = JSON.parse(requestBody)
     return JSON.stringify(body, null, 2)
   } catch { return requestBody || '' }
+}
+
+function formatRawResponse(responseBody) {
+  if (!responseBody) return '(no response)'
+  try {
+    const body = JSON.parse(responseBody)
+    return JSON.stringify(body, null, 2)
+  } catch { return responseBody || '' }
 }
 
 function extractRequestSummary(requestBody) {
