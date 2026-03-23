@@ -402,6 +402,7 @@ $supervisorBtn.addEventListener('click', () => {
 
 let codeViewerActive = false
 let codeViewerSessionId = null
+let codeViewerFilePath = null
 
 $codeBtn.addEventListener('click', () => {
   const sid = selectedSession && selectedSession !== '__starred__'
@@ -526,6 +527,7 @@ async function enterCodeViewer(sessionId, preloadPath, scrollToLine) {
 function exitCodeViewer() {
   codeViewerActive = false
   codeViewerSessionId = null
+  codeViewerFilePath = null
   pushState()
   $promptViewBtn.style.display = 'none'
   $codeBtn.style.display = ''
@@ -617,6 +619,8 @@ function bindTreeClicks(sessionId) {
 }
 
 async function loadCodeFile(sessionId, filePath, scrollToLine) {
+  codeViewerFilePath = filePath
+  pushState()
   const $code = document.getElementById('cvCode')
   $code.innerHTML = '<div class="cv-loading">Loading…</div>'
   document.getElementById('cvTimeline').innerHTML = '<div class="cv-empty">Click an annotation to see request details</div>'
@@ -2298,7 +2302,10 @@ function pushState() {
   const params = new URLSearchParams()
   if (selectedSession) params.set('session', selectedSession)
   if (selectedRequest) params.set('req', selectedRequest)
-  if (codeViewerActive && codeViewerSessionId) params.set('view', 'code')
+  if (codeViewerActive && codeViewerSessionId) {
+    params.set('view', 'code')
+    if (codeViewerFilePath) params.set('file', codeViewerFilePath)
+  }
   const hash = params.toString()
   history.replaceState(null, '', hash ? '#' + hash : location.pathname + location.search)
 }
@@ -2323,7 +2330,8 @@ async function restoreFromHash() {
       await loadDetail(req)
     }
     if (view === 'code' && session && sessions.some(s => s.id === session)) {
-      await enterCodeViewer(session)
+      const file = params.get('file') || undefined
+      await enterCodeViewer(session, file)
     }
   } catch (e) {
     console.warn('restoreFromHash failed:', e)
