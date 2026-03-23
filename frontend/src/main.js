@@ -2252,18 +2252,24 @@ async function restoreFromHash() {
   const req = params.get('req')
   const view = params.get('view')
 
-  if (session) {
-    selectedSession = session
-    renderSessions()
-    await loadRequests()
-  }
-  if (req) {
-    selectedRequest = req
-    renderRequests()
-    await loadDetail(req)
-  }
-  if (view === 'code' && session) {
-    await enterCodeViewer(session)
+  try {
+    if (session && sessions.some(s => s.id === session)) {
+      selectedSession = session
+      renderSessions()
+      await loadRequests()
+    }
+    if (req) {
+      selectedRequest = req
+      renderRequests()
+      await loadDetail(req)
+    }
+    if (view === 'code' && session && sessions.some(s => s.id === session)) {
+      await enterCodeViewer(session)
+    }
+  } catch (e) {
+    console.warn('restoreFromHash failed:', e)
+    // Clear bad hash so next refresh starts fresh
+    history.replaceState(null, '', location.pathname)
   }
 }
 
