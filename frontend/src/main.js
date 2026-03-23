@@ -413,6 +413,7 @@ $codeBtn.addEventListener('click', () => {
 async function enterCodeViewer(sessionId, preloadPath, scrollToLine) {
   codeViewerActive = true
   codeViewerSessionId = sessionId
+  pushState()
   $promptViewBtn.style.display = ''
   $codeBtn.style.display = 'none'
   const sess = sessions.find(s => s.id === sessionId)
@@ -524,6 +525,7 @@ async function enterCodeViewer(sessionId, preloadPath, scrollToLine) {
 function exitCodeViewer() {
   codeViewerActive = false
   codeViewerSessionId = null
+  pushState()
   $promptViewBtn.style.display = 'none'
   $codeBtn.style.display = ''
   const cvRoot = document.getElementById('codeViewerRoot')
@@ -1468,8 +1470,10 @@ function renderSessions() {
       if (e.target.closest('[data-del-sid]')) return  // handled below
       selectedSession = el.dataset.sid || null
       if (selectedSession === '') selectedSession = null
+      selectedRequest = null
       renderSessions()
       loadRequests()
+      pushState()
       // Update supervisor panel if open
       if (supervisorSessionId && selectedSession && selectedSession !== '__starred__') {
         renderSupervisorPanel(selectedSession)
@@ -1534,6 +1538,7 @@ function renderRequests() {
       selectedRequest = el.dataset.rid
       renderRequests()
       loadDetail(selectedRequest)
+      pushState()
     })
   })
   $reqList.querySelectorAll('[data-star-rid]').forEach(btn => {
@@ -2228,6 +2233,40 @@ async function loadDetail(id) {
   renderDetail(req, prevMessageCount, msgTimestamps)
 }
 
+// ── URL State Persistence ─────────────────────────────────────────────────────
+
+function pushState() {
+  const params = new URLSearchParams()
+  if (selectedSession) params.set('session', selectedSession)
+  if (selectedRequest) params.set('req', selectedRequest)
+  if (codeViewerActive && codeViewerSessionId) params.set('view', 'code')
+  const hash = params.toString()
+  history.replaceState(null, '', hash ? '#' + hash : location.pathname + location.search)
+}
+
+async function restoreFromHash() {
+  const hash = location.hash.slice(1)
+  if (!hash) return
+  const params = new URLSearchParams(hash)
+  const session = params.get('session')
+  const req = params.get('req')
+  const view = params.get('view')
+
+  if (session) {
+    selectedSession = session
+    renderSessions()
+    await loadRequests()
+  }
+  if (req) {
+    selectedRequest = req
+    renderRequests()
+    await loadDetail(req)
+  }
+  if (view === 'code' && session) {
+    await enterCodeViewer(session)
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 async function init() {
   // Load intercept status
@@ -2246,6 +2285,7 @@ async function init() {
 
   await loadSessions()
   await loadRequests()
+  await restoreFromHash()
 
   let sseRefreshTimer = null
   connectEvents((e) => {
