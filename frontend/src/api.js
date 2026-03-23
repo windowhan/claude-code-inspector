@@ -5,7 +5,7 @@ export async function getSessions() {
   return r.json()
 }
 
-export async function getRequests(sessionId, { starred = false, search = '', limit = 100, offset = 0 } = {}) {
+export async function getRequests(sessionId, { starred = false, search = '', source = '', limit = 100, offset = 0 } = {}) {
   const params = new URLSearchParams({ limit, offset })
   if (starred) {
     params.set('starred', '1')
@@ -13,6 +13,7 @@ export async function getRequests(sessionId, { starred = false, search = '', lim
     params.set('session_id', sessionId)
   }
   if (search) params.set('search', search)
+  if (source) params.set('source', source)
   const r = await fetch(`${BASE}/api/requests?${params}`)
   return r.json()
 }
@@ -188,4 +189,56 @@ export function connectEvents(cb) {
   }
   connect()
   return () => es?.close()
+}
+
+// ── Supervisor LLM API ───────────────────────────────────────────────────────
+
+export async function getSupervisorConfig() {
+  const r = await fetch(`${BASE}/api/supervisor/config`)
+  return r.json()
+}
+
+export async function saveSupervisorConfig(config) {
+  const r = await fetch(`${BASE}/api/supervisor/config`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(config),
+  })
+  return r.json()
+}
+
+export async function getSessionGoal(sessionId) {
+  const r = await fetch(`${BASE}/api/supervisor/goals/${sessionId}`)
+  if (r.status === 404) return null
+  return r.json()
+}
+
+export async function setSessionGoal(sessionId, goal, refinedGoal) {
+  const body = { goal }
+  if (refinedGoal) body.refined_goal = refinedGoal
+  const r = await fetch(`${BASE}/api/supervisor/goals/${sessionId}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return r.json()
+}
+
+export async function deleteSessionGoal(sessionId) {
+  const r = await fetch(`${BASE}/api/supervisor/goals/${sessionId}`, { method: 'DELETE' })
+  return r.json()
+}
+
+export async function refineGoal(goalText) {
+  const r = await fetch(`${BASE}/api/supervisor/refine-goal`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ goal: goalText }),
+  })
+  return r.json()
+}
+
+export async function getSupervisorAnalyses(sessionId, limit = 10) {
+  const r = await fetch(`${BASE}/api/supervisor/analyses/${sessionId}?limit=${limit}`)
+  return r.json()
 }

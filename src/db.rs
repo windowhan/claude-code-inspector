@@ -93,6 +93,41 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             result TEXT NOT NULL,
             cached_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS supervisor_config (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            provider TEXT NOT NULL DEFAULT 'anthropic',
+            base_url TEXT NOT NULL DEFAULT 'https://api.anthropic.com',
+            api_key TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT 'claude-haiku-4-5-20251001',
+            interval_minutes INTEGER NOT NULL DEFAULT 10,
+            discord_webhook_url TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS session_goals (
+            session_id TEXT PRIMARY KEY,
+            goal TEXT NOT NULL,
+            refined_goal TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS supervisor_analysis (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            analyzed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_request_id TEXT,
+            goal_alignment_score REAL,
+            efficiency_score REAL,
+            intent_execution_match TEXT,
+            token_summary TEXT,
+            issues TEXT,
+            recommendation TEXT,
+            raw_llm_response TEXT,
+            discord_sent INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_supervisor_analysis_session ON supervisor_analysis(session_id);
     ")?;
     // Migration: add starred column if not yet present (safe to run on existing DBs)
     let _ = conn.execute(
@@ -140,6 +175,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let _ = conn.execute(
         "ALTER TABLE routing_rules ADD COLUMN prompt_override TEXT NOT NULL DEFAULT ''", [],
     );
+    // Migration: add source column for multi-source support (Cursor + Claude Code)
+    let _ = conn.execute(
+        "ALTER TABLE requests ADD COLUMN source TEXT NOT NULL DEFAULT 'claude_code'", [],
+    );
+    // Migration: add target_host column
+    let _ = conn.execute(
+        "ALTER TABLE requests ADD COLUMN target_host TEXT NOT NULL DEFAULT 'api.anthropic.com'", [],
+    );
+    // Migration: add source index
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_source ON requests(source)", [],
+    );
     Ok(())
 }
 
@@ -147,7 +194,10 @@ pub fn upsert_session(conn: &Connection, session: &SessionRecord) -> Result<()> 
     conn.execute(
         "INSERT INTO sessions (id, pid, cwd, project_name, started_at, last_seen_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(id) DO UPDATE SET last_seen_at = excluded.last_seen_at",
+         ON CONFLICT(id) DO UPDATE SET
+             cwd          = COALESCE(NULLIF(excluded.cwd, ''), sessions.cwd),
+             project_name = COALESCE(NULLIF(excluded.project_name, ''), sessions.project_name),
+             last_seen_at = excluded.last_seen_at",
         params![
             session.id,
             session.pid,
@@ -162,8 +212,8 @@ pub fn upsert_session(conn: &Connection, session: &SessionRecord) -> Result<()> 
 
 pub fn insert_request(conn: &Connection, req: &RequestRecord) -> Result<()> {
     conn.execute(
-        "INSERT INTO requests (id, session_id, timestamp, method, path, request_headers, request_body, is_streaming, status, agent_type, agent_task, routing_category, routed_to_url)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO requests (id, session_id, timestamp, method, path, request_headers, request_body, is_streaming, status, agent_type, agent_task, routing_category, routed_to_url, source, target_host)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             req.id,
             req.session_id,
@@ -178,6 +228,8 @@ pub fn insert_request(conn: &Connection, req: &RequestRecord) -> Result<()> {
             req.agent_task,
             req.routing_category,
             req.routed_to_url,
+            req.source,
+            req.target_host,
         ],
     )?;
     Ok(())
@@ -242,6 +294,20 @@ pub fn update_request_body(conn: &Connection, id: &str, body: &str) -> Result<()
     Ok(())
 }
 
+/// Update a Cursor user-bubble request with the AI response body and output token count.
+pub fn update_cursor_response(
+    conn: &Connection,
+    id: &str,
+    response_body: &str,
+    output_tokens: Option<i64>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE requests SET response_body = ?1, output_tokens = ?2, status = 'complete' WHERE id = ?3",
+        params![response_body, output_tokens, id],
+    )?;
+    Ok(())
+}
+
 /// Delete a session and all its requests, file access records, and cached analyses.
 pub fn delete_session(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM file_access WHERE session_id = ?1", params![id])?;
@@ -266,7 +332,7 @@ pub fn get_starred_requests(conn: &Connection, limit: i64, offset: i64) -> Resul
         "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                 response_status, response_headers, response_body, is_streaming,
                 input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
-                routing_category, routed_to_url
+                routing_category, routed_to_url, source, target_host
          FROM requests WHERE starred = 1
          ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
     )?;
@@ -349,33 +415,63 @@ pub fn get_session_stats(conn: &Connection) -> Result<Vec<serde_json::Value>> {
 pub fn get_requests(
     conn: &Connection,
     session_id: Option<&str>,
+    source: Option<&str>,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<RequestRecord>> {
-    let rows = if let Some(sid) = session_id {
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
-                    response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
-                    routing_category, routed_to_url
-             FROM requests WHERE session_id = ?1
-             ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
-        )?;
-        let x = stmt.query_map(params![sid, limit, offset], map_request_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        x
-    } else {
-        let mut stmt = conn.prepare(
-            "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
-                    response_status, response_headers, response_body, is_streaming,
-                    input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
-                    routing_category, routed_to_url
-             FROM requests
-             ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
-        )?;
-        let x = stmt.query_map(params![limit, offset], map_request_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        x
+    let rows = match (session_id, source) {
+        (Some(sid), Some(src)) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                        response_status, response_headers, response_body, is_streaming,
+                        input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                        routing_category, routed_to_url, source, target_host
+                 FROM requests WHERE session_id = ?1 AND source = ?2
+                 ORDER BY timestamp DESC LIMIT ?3 OFFSET ?4"
+            )?;
+            let x = stmt.query_map(params![sid, src, limit, offset], map_request_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            x
+        }
+        (Some(sid), None) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                        response_status, response_headers, response_body, is_streaming,
+                        input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                        routing_category, routed_to_url, source, target_host
+                 FROM requests WHERE session_id = ?1
+                 ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
+            )?;
+            let x = stmt.query_map(params![sid, limit, offset], map_request_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            x
+        }
+        (None, Some(src)) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                        response_status, response_headers, response_body, is_streaming,
+                        input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                        routing_category, routed_to_url, source, target_host
+                 FROM requests WHERE source = ?1
+                 ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
+            )?;
+            let x = stmt.query_map(params![src, limit, offset], map_request_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            x
+        }
+        (None, None) => {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                        response_status, response_headers, response_body, is_streaming,
+                        input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
+                        routing_category, routed_to_url, source, target_host
+                 FROM requests
+                 ORDER BY timestamp DESC LIMIT ?1 OFFSET ?2"
+            )?;
+            let x = stmt.query_map(params![limit, offset], map_request_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            x
+        }
     };
     Ok(rows)
 }
@@ -393,7 +489,7 @@ pub fn search_requests(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
                     input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
-                    routing_category, routed_to_url
+                    routing_category, routed_to_url, source, target_host
              FROM requests
              WHERE session_id = ?1
                AND (request_body LIKE ?2 OR response_body LIKE ?2 OR path LIKE ?2)
@@ -407,7 +503,7 @@ pub fn search_requests(
             "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                     response_status, response_headers, response_body, is_streaming,
                     input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
-                    routing_category, routed_to_url
+                    routing_category, routed_to_url, source, target_host
              FROM requests
              WHERE request_body LIKE ?1 OR response_body LIKE ?1 OR path LIKE ?1
              ORDER BY timestamp DESC LIMIT ?2 OFFSET ?3"
@@ -424,7 +520,7 @@ pub fn get_request_by_id(conn: &Connection, id: &str) -> Result<Option<RequestRe
         "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
                 response_status, response_headers, response_body, is_streaming,
                 input_tokens, output_tokens, duration_ms, status, starred, memo, agent_type, agent_task,
-                routing_category, routed_to_url
+                routing_category, routed_to_url, source, target_host
          FROM requests WHERE id = ?1"
     )?;
     let mut rows = stmt.query_map(params![id], map_request_row)?;
@@ -454,6 +550,8 @@ fn map_request_row(row: &rusqlite::Row) -> rusqlite::Result<RequestRecord> {
         agent_task: row.get::<_, String>(18).unwrap_or_default(),
         routing_category: row.get::<_, String>(19).unwrap_or_default(),
         routed_to_url: row.get::<_, String>(20).unwrap_or_default(),
+        source: row.get::<_, String>(21).unwrap_or_else(|_| "claude_code".to_string()),
+        target_host: row.get::<_, String>(22).unwrap_or_else(|_| "api.anthropic.com".to_string()),
     })
 }
 
@@ -624,6 +722,34 @@ pub fn save_summarizer_config(conn: &Connection, config: &SummarizerConfig) -> R
     Ok(())
 }
 
+// ── Supervisor LLM config ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct SupervisorConfig {
+    pub enabled: bool,
+    pub provider: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub interval_minutes: i64,
+    pub discord_webhook_url: String,
+}
+
+impl Default for SupervisorConfig {
+    fn default() -> Self {
+        SupervisorConfig {
+            enabled: false,
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: String::new(),
+            model: "claude-haiku-4-5-20251001".to_string(),
+            interval_minutes: 10,
+            discord_webhook_url: String::new(),
+        }
+    }
+}
+
 // ── Supervisor (file access + cache) ─────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -711,6 +837,279 @@ pub fn set_supervisor_cache(
     Ok(())
 }
 
+// ── Supervisor LLM CRUD ───────────────────────────────────────────────────────
+
+#[allow(dead_code)]
+fn row_to_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRecord> {
+    Ok(RequestRecord {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        timestamp: row.get(2)?,
+        method: row.get(3)?,
+        path: row.get(4)?,
+        request_headers: row.get(5)?,
+        request_body: row.get(6)?,
+        response_status: row.get(7)?,
+        response_headers: row.get(8)?,
+        response_body: row.get(9)?,
+        is_streaming: row.get::<_, i64>(10)? != 0,
+        input_tokens: row.get(11)?,
+        output_tokens: row.get(12)?,
+        duration_ms: row.get(13)?,
+        status: row.get(14)?,
+        starred: row.get::<_, i64>(15)? != 0,
+        memo: row.get(16)?,
+        agent_type: row.get(17)?,
+        agent_task: row.get(18)?,
+        routing_category: row.get(19)?,
+        routed_to_url: row.get(20)?,
+        source: row.get::<_, String>(21).unwrap_or_else(|_| "claude_code".to_string()),
+        target_host: row.get::<_, String>(22).unwrap_or_else(|_| "api.anthropic.com".to_string()),
+    })
+}
+
+pub fn get_supervisor_config(conn: &Connection) -> Result<SupervisorConfig> {
+    let mut stmt = conn.prepare(
+        "SELECT enabled, provider, base_url, api_key, model, interval_minutes, discord_webhook_url
+         FROM supervisor_config WHERE id = 1"
+    )?;
+    match stmt.query_row([], |row| {
+        Ok(SupervisorConfig {
+            enabled: row.get::<_, i64>(0)? != 0,
+            provider: row.get(1)?,
+            base_url: row.get(2)?,
+            api_key: row.get(3)?,
+            model: row.get(4)?,
+            interval_minutes: row.get(5)?,
+            discord_webhook_url: row.get(6)?,
+        })
+    }) {
+        Ok(c) => Ok(c),
+        Err(_) => Ok(SupervisorConfig::default()),
+    }
+}
+
+#[allow(dead_code)]
+pub fn save_supervisor_config(conn: &Connection, config: &SupervisorConfig) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO supervisor_config (id, enabled, provider, base_url, api_key, model, interval_minutes, discord_webhook_url)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            config.enabled as i64,
+            config.provider,
+            config.base_url,
+            config.api_key,
+            config.model,
+            config.interval_minutes,
+            config.discord_webhook_url,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn get_session_goal(conn: &Connection, session_id: &str) -> Result<Option<crate::types::SessionGoal>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, goal, refined_goal, created_at, updated_at
+         FROM session_goals WHERE session_id = ?1"
+    )?;
+    let mut rows = stmt.query_map(params![session_id], |row| {
+        Ok(crate::types::SessionGoal {
+            session_id: row.get(0)?,
+            goal: row.get(1)?,
+            refined_goal: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
+#[allow(dead_code)]
+pub fn set_session_goal(conn: &Connection, session_id: &str, goal: &str, refined_goal: Option<&str>) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO session_goals (session_id, goal, refined_goal, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(session_id) DO UPDATE SET goal = ?2, refined_goal = ?3, updated_at = ?5",
+        params![session_id, goal, refined_goal, now, now],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn delete_session_goal(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM session_goals WHERE session_id = ?1", params![session_id])?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn get_all_session_goals(conn: &Connection) -> Result<Vec<crate::types::SessionGoal>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, goal, refined_goal, created_at, updated_at FROM session_goals"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(crate::types::SessionGoal {
+            session_id: row.get(0)?,
+            goal: row.get(1)?,
+            refined_goal: row.get(2)?,
+            created_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn insert_supervisor_analysis(conn: &Connection, analysis: &crate::types::SupervisorAnalysis) -> Result<()> {
+    conn.execute(
+        "INSERT INTO supervisor_analysis
+         (id, session_id, analyzed_at, last_request_id, goal_alignment_score, efficiency_score,
+          intent_execution_match, token_summary, issues, recommendation, raw_llm_response, discord_sent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            analysis.id,
+            analysis.session_id,
+            analysis.analyzed_at,
+            analysis.last_request_id,
+            analysis.goal_alignment_score,
+            analysis.efficiency_score,
+            analysis.intent_execution_match,
+            analysis.token_summary,
+            analysis.issues,
+            analysis.recommendation,
+            analysis.raw_llm_response,
+            analysis.discord_sent as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn get_supervisor_analyses(conn: &Connection, session_id: &str, limit: i64) -> Result<Vec<crate::types::SupervisorAnalysis>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, analyzed_at, last_request_id, goal_alignment_score, efficiency_score,
+                intent_execution_match, token_summary, issues, recommendation, raw_llm_response, discord_sent
+         FROM supervisor_analysis WHERE session_id = ?1
+         ORDER BY analyzed_at DESC
+         LIMIT ?2"
+    )?;
+    let rows = stmt.query_map(params![session_id, limit], |row| {
+        Ok(crate::types::SupervisorAnalysis {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            analyzed_at: row.get(2)?,
+            last_request_id: row.get(3)?,
+            goal_alignment_score: row.get(4)?,
+            efficiency_score: row.get(5)?,
+            intent_execution_match: row.get(6)?,
+            token_summary: row.get(7)?,
+            issues: row.get(8)?,
+            recommendation: row.get(9)?,
+            raw_llm_response: row.get(10)?,
+            discord_sent: row.get::<_, i64>(11)? != 0,
+        })
+    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn get_latest_supervisor_analysis(conn: &Connection, session_id: &str) -> Result<Option<crate::types::SupervisorAnalysis>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, analyzed_at, last_request_id, goal_alignment_score, efficiency_score,
+                intent_execution_match, token_summary, issues, recommendation, raw_llm_response, discord_sent
+         FROM supervisor_analysis WHERE session_id = ?1
+         ORDER BY analyzed_at DESC LIMIT 1"
+    )?;
+    let mut rows = stmt.query_map(params![session_id], |row| {
+        Ok(crate::types::SupervisorAnalysis {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            analyzed_at: row.get(2)?,
+            last_request_id: row.get(3)?,
+            goal_alignment_score: row.get(4)?,
+            efficiency_score: row.get(5)?,
+            intent_execution_match: row.get(6)?,
+            token_summary: row.get(7)?,
+            issues: row.get(8)?,
+            recommendation: row.get(9)?,
+            raw_llm_response: row.get(10)?,
+            discord_sent: row.get::<_, i64>(11)? != 0,
+        })
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
+pub fn mark_analysis_discord_sent(conn: &Connection, analysis_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE supervisor_analysis SET discord_sent = 1 WHERE id = ?1",
+        params![analysis_id],
+    )?;
+    Ok(())
+}
+
+/// Returns requests for a session that come AFTER the given watermark request ID.
+/// Uses rowid-based comparison for deterministic ordering.
+/// LIMIT 50 prevents unbounded queries.
+pub fn get_unanalyzed_requests(
+    conn: &Connection,
+    session_id: &str,
+    after_request_id: Option<&str>,
+) -> Result<Vec<RequestRecord>> {
+    let rows = if let Some(wm_id) = after_request_id {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                    response_status, response_headers, response_body, is_streaming,
+                    input_tokens, output_tokens, duration_ms, status, starred, memo,
+                    agent_type, agent_task, routing_category, routed_to_url
+             FROM requests
+             WHERE session_id = ?1
+               AND rowid > (SELECT rowid FROM requests WHERE id = ?2)
+             ORDER BY rowid ASC
+             LIMIT 50"
+        )?;
+        let result = stmt.query_map(params![session_id, wm_id], row_to_request)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        result
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, timestamp, method, path, request_headers, request_body,
+                    response_status, response_headers, response_body, is_streaming,
+                    input_tokens, output_tokens, duration_ms, status, starred, memo,
+                    agent_type, agent_task, routing_category, routed_to_url
+             FROM requests
+             WHERE session_id = ?1
+             ORDER BY rowid ASC
+             LIMIT 50"
+        )?;
+        let result = stmt.query_map(params![session_id], row_to_request)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        result
+    };
+    Ok(rows)
+}
+
+/// Returns active sessions (last_seen_at within 2 hours) that have goals set.
+pub fn get_active_sessions_with_goals(conn: &Connection) -> Result<Vec<(crate::types::SessionGoal, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT sg.session_id, sg.goal, sg.refined_goal, sg.created_at, sg.updated_at, s.id
+         FROM session_goals sg
+         JOIN sessions s ON s.id = sg.session_id
+         WHERE julianday(s.last_seen_at) > julianday('now', '-2 hours')"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            crate::types::SessionGoal {
+                session_id: row.get(0)?,
+                goal: row.get(1)?,
+                refined_goal: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            },
+            row.get::<_, String>(5)?,
+        ))
+    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -758,6 +1157,8 @@ mod tests {
             agent_task: String::new(),
             routing_category: String::new(),
             routed_to_url: String::new(),
+            source: "claude_code".to_string(),
+            target_host: "api.anthropic.com".to_string(),
         }
     }
 
@@ -885,7 +1286,7 @@ mod tests {
         insert_request(&conn, &sample_request("r1", "s1")).unwrap();
         insert_request(&conn, &sample_request("r2", "s1")).unwrap();
 
-        let reqs = get_requests(&conn, None, 10, 0).unwrap();
+        let reqs = get_requests(&conn, None, None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 2);
     }
 
@@ -897,7 +1298,7 @@ mod tests {
         insert_request(&conn, &sample_request("r1", "s1")).unwrap();
         insert_request(&conn, &sample_request("r2", "s2")).unwrap();
 
-        let reqs = get_requests(&conn, Some("s1"), 10, 0).unwrap();
+        let reqs = get_requests(&conn, Some("s1"), None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].id, "r1");
     }
@@ -910,9 +1311,9 @@ mod tests {
             insert_request(&conn, &sample_request(&format!("r{i}"), "s1")).unwrap();
         }
 
-        let page1 = get_requests(&conn, None, 2, 0).unwrap();
-        let page2 = get_requests(&conn, None, 2, 2).unwrap();
-        let page3 = get_requests(&conn, None, 2, 4).unwrap();
+        let page1 = get_requests(&conn, None, None, 2, 0).unwrap();
+        let page2 = get_requests(&conn, None, None, 2, 2).unwrap();
+        let page3 = get_requests(&conn, None, None, 2, 4).unwrap();
 
         assert_eq!(page1.len(), 2);
         assert_eq!(page2.len(), 2);
@@ -965,7 +1366,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "s2");
 
-        let reqs = get_requests(&conn, None, 10, 0).unwrap();
+        let reqs = get_requests(&conn, None, None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].id, "r3");
     }
@@ -1296,5 +1697,142 @@ mod tests {
         assert!(accesses.is_empty());
         let cache = get_supervisor_cache(&conn, "s1", "summary", 1, 0).unwrap();
         assert!(cache.is_none());
+    }
+
+    #[test]
+    fn supervisor_config_defaults_when_empty() {
+        let conn = setup();
+        let config = get_supervisor_config(&conn).unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.provider, "anthropic");
+        assert_eq!(config.interval_minutes, 10);
+        assert!(config.api_key.is_empty());
+    }
+
+    #[test]
+    fn supervisor_config_save_and_load() {
+        let conn = setup();
+        let config = SupervisorConfig {
+            enabled: true,
+            provider: "openai".to_string(),
+            base_url: "https://api.openai.com".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-4".to_string(),
+            interval_minutes: 5,
+            discord_webhook_url: "https://discord.com/webhook/test".to_string(),
+        };
+        save_supervisor_config(&conn, &config).unwrap();
+        let loaded = get_supervisor_config(&conn).unwrap();
+        assert!(loaded.enabled);
+        assert_eq!(loaded.api_key, "sk-test");
+        assert_eq!(loaded.interval_minutes, 5);
+    }
+
+    #[test]
+    fn session_goal_crud() {
+        let conn = setup();
+        // Insert
+        set_session_goal(&conn, "sess-1", "Refactor auth module", None).unwrap();
+        let goal = get_session_goal(&conn, "sess-1").unwrap().unwrap();
+        assert_eq!(goal.goal, "Refactor auth module");
+        assert!(goal.refined_goal.is_none());
+        // Update
+        set_session_goal(&conn, "sess-1", "Refactor auth module", Some("Specifically the JWT validation logic")).unwrap();
+        let updated = get_session_goal(&conn, "sess-1").unwrap().unwrap();
+        assert_eq!(updated.refined_goal, Some("Specifically the JWT validation logic".to_string()));
+        // Delete
+        delete_session_goal(&conn, "sess-1").unwrap();
+        assert!(get_session_goal(&conn, "sess-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn get_unanalyzed_requests_watermark() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("sess-wm")).unwrap();
+        for i in 1..=5 {
+            let mut req = sample_request(&format!("req-{i}"), "sess-wm");
+            req.status = "complete".to_string();
+            insert_request(&conn, &req).unwrap();
+        }
+        // No watermark: returns first 50 (all 5 here)
+        let all = get_unanalyzed_requests(&conn, "sess-wm", None).unwrap();
+        assert_eq!(all.len(), 5);
+        // Watermark at req-2: returns req-3, req-4, req-5
+        let after = get_unanalyzed_requests(&conn, "sess-wm", Some("req-2")).unwrap();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].id, "req-3");
+    }
+
+    #[test]
+    fn get_unanalyzed_requests_limit_50() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("sess-limit")).unwrap();
+        for i in 1..=60 {
+            let mut req = sample_request(&format!("req-limit-{i:03}"), "sess-limit");
+            req.status = "complete".to_string();
+            insert_request(&conn, &req).unwrap();
+        }
+        let result = get_unanalyzed_requests(&conn, "sess-limit", None).unwrap();
+        assert_eq!(result.len(), 50);
+    }
+
+    #[test]
+    fn supervisor_analysis_insert_and_query() {
+        let conn = setup();
+        let analysis = crate::types::SupervisorAnalysis {
+            id: "analysis-1".to_string(),
+            session_id: "sess-1".to_string(),
+            analyzed_at: "2024-01-01T00:00:00Z".to_string(),
+            last_request_id: Some("req-5".to_string()),
+            goal_alignment_score: Some(0.85),
+            efficiency_score: Some(0.70),
+            intent_execution_match: Some(r#"{"assessment":"aligned"}"#.to_string()),
+            token_summary: Some(r#"{"total_input":1000,"total_output":500}"#.to_string()),
+            issues: Some("[]".to_string()),
+            recommendation: Some("Good progress".to_string()),
+            raw_llm_response: Some("{}".to_string()),
+            discord_sent: false,
+        };
+        insert_supervisor_analysis(&conn, &analysis).unwrap();
+        let loaded = get_latest_supervisor_analysis(&conn, "sess-1").unwrap().unwrap();
+        assert_eq!(loaded.id, "analysis-1");
+        assert_eq!(loaded.goal_alignment_score, Some(0.85));
+        assert!(!loaded.discord_sent);
+        mark_analysis_discord_sent(&conn, "analysis-1").unwrap();
+        let updated = get_latest_supervisor_analysis(&conn, "sess-1").unwrap().unwrap();
+        assert!(updated.discord_sent);
+    }
+
+    #[test]
+    fn get_active_sessions_with_goals_filters_stale() {
+        let conn = setup();
+        // Active session (last_seen_at now)
+        let mut active = sample_session("sess-active");
+        active.last_seen_at = chrono::Utc::now().to_rfc3339();
+        upsert_session(&conn, &active).unwrap();
+        set_session_goal(&conn, "sess-active", "Active goal", None).unwrap();
+        // Stale session (last_seen_at 3 hours ago)
+        let mut stale = sample_session("sess-stale");
+        stale.last_seen_at = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+        upsert_session(&conn, &stale).unwrap();
+        set_session_goal(&conn, "sess-stale", "Stale goal", None).unwrap();
+
+        let active_sessions = get_active_sessions_with_goals(&conn).unwrap();
+        assert_eq!(active_sessions.len(), 1);
+        assert_eq!(active_sessions[0].0.session_id, "sess-active");
+    }
+
+    #[test]
+    fn get_all_session_goals_returns_all() {
+        let conn = setup();
+        set_session_goal(&conn, "sess-a", "Goal A", None).unwrap();
+        set_session_goal(&conn, "sess-b", "Goal B", Some("Refined B")).unwrap();
+        let goals = get_all_session_goals(&conn).unwrap();
+        assert_eq!(goals.len(), 2);
+        let ids: Vec<&str> = goals.iter().map(|g| g.session_id.as_str()).collect();
+        assert!(ids.contains(&"sess-a"));
+        assert!(ids.contains(&"sess-b"));
+        let b = goals.iter().find(|g| g.session_id == "sess-b").unwrap();
+        assert_eq!(b.refined_goal.as_deref(), Some("Refined B"));
     }
 }

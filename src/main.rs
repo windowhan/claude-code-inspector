@@ -1,3 +1,4 @@
+mod cursor_db;
 mod db;
 mod dashboard;
 mod functions;
@@ -8,6 +9,8 @@ mod routing;
 mod session;
 mod sse_tee;
 mod supervisor;
+mod llm;
+mod supervisor_llm;
 mod types;
 
 use std::net::SocketAddr;
@@ -70,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
     let (event_tx, _) = broadcast::channel(256);
     let state = AppState::new(conn, event_tx);
 
+    tokio::spawn(cursor_db::watch(Arc::clone(&state)));
+
     match args.command.unwrap_or(Command::Serve) {
         Command::Serve => run_server(state, &args.proxy_addr, &args.dashboard_addr).await,
         Command::Mcp   => mcp::run_mcp_server(state).await,
@@ -120,6 +125,26 @@ async fn run_server(state: Arc<AppState>, proxy_addr: &str, dashboard_addr: &str
     println!("  Claude Code MCP integration:");
     println!("    claude mcp add claude-inspector -- $(which claude-code-hook) mcp");
     println!();
+    println!("  Cursor DB watcher: active (polling every 3s)");
+
+    // Start supervisor LLM background task if configured
+    {
+        let config = {
+            let db = state.db.lock().await;
+            db::get_supervisor_config(&db).unwrap_or_default()
+        };
+        if config.enabled && !config.api_key.is_empty() {
+            let state_sup = Arc::clone(&state);
+            let handle = tokio::spawn(async move {
+                supervisor_llm::run_supervisor_loop(state_sup).await;
+            });
+            let mut h = state.supervisor_handle.lock().await;
+            *h = Some(handle);
+            info!("Supervisor LLM task started");
+        } else {
+            info!("Supervisor LLM not configured (set api_key + enabled=true in settings)");
+        }
+    }
 
     let state_proxy     = Arc::clone(&state);
     let state_dashboard = Arc::clone(&state);
@@ -139,7 +164,7 @@ async fn run_server(state: Arc<AppState>, proxy_addr: &str, dashboard_addr: &str
                             let sc    = sc.clone();
                             async move { proxy::handle_request(req, state, peer_addr, sc).await }
                         });
-                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+                        if let Err(e) = http1::Builder::new().serve_connection(io, svc).with_upgrades().await {
                             tracing::debug!("Proxy connection: {e}");
                         }
                     });

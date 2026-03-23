@@ -48,7 +48,14 @@ pub struct RequestRecord {
     pub agent_task: String,   // short description of what the sub-agent is doing
     pub routing_category: String,
     pub routed_to_url: String,
+    #[serde(default = "default_source")]
+    pub source: String,
+    #[serde(default = "default_target_host")]
+    pub target_host: String,
 }
+
+fn default_source() -> String { "claude_code".to_string() }
+fn default_target_host() -> String { "api.anthropic.com".to_string() }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardEvent {
@@ -95,6 +102,33 @@ pub struct RoutingRule {
     pub label:          String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct SessionGoal {
+    pub session_id: String,
+    pub goal: String,
+    pub refined_goal: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct SupervisorAnalysis {
+    pub id: String,
+    pub session_id: String,
+    pub analyzed_at: String,
+    pub last_request_id: Option<String>,
+    pub goal_alignment_score: Option<f64>,
+    pub efficiency_score: Option<f64>,
+    pub intent_execution_match: Option<String>,
+    pub token_summary: Option<String>,
+    pub issues: Option<String>,
+    pub recommendation: Option<String>,
+    pub raw_llm_response: Option<String>,
+    pub discord_sent: bool,
+}
+
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub event_tx: broadcast::Sender<DashboardEvent>,
@@ -103,10 +137,14 @@ pub struct AppState {
     pub intercepted: std::sync::Mutex<HashMap<String, oneshot::Sender<InterceptAction>>>,
     pub routing_config: RwLock<RoutingConfig>,
     pub routing_rules: RwLock<Vec<RoutingRule>>,
+    #[allow(dead_code)]
+    pub supervisor_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    #[allow(dead_code)]
+    pub supervisor_analyzing: AtomicBool,
 }
 
 impl AppState {
-    /// Production constructor — loads routing config/rules from DB.
+    /// Production constructor — loads routing config/rules from DB and CA from disk.
     pub fn new(db: Connection, event_tx: broadcast::Sender<DashboardEvent>) -> Arc<Self> {
         let routing_config = crate::db::get_routing_config(&db).unwrap_or_default();
         let routing_rules = crate::db::get_routing_rules(&db).unwrap_or_default();
@@ -118,6 +156,8 @@ impl AppState {
             intercepted: std::sync::Mutex::new(HashMap::new()),
             routing_config: RwLock::new(routing_config),
             routing_rules: RwLock::new(routing_rules),
+            supervisor_handle: tokio::sync::Mutex::new(None),
+            supervisor_analyzing: AtomicBool::new(false),
         })
     }
 
@@ -136,6 +176,8 @@ impl AppState {
             intercepted: std::sync::Mutex::new(HashMap::new()),
             routing_config: RwLock::new(RoutingConfig::default()),
             routing_rules: RwLock::new(Vec::new()),
+            supervisor_handle: tokio::sync::Mutex::new(None),
+            supervisor_analyzing: AtomicBool::new(false),
         })
     }
 }
@@ -207,6 +249,8 @@ mod tests {
             agent_task: String::new(),
             routing_category: String::new(),
             routed_to_url: String::new(),
+            source: "claude_code".to_string(),
+            target_host: "api.anthropic.com".to_string(),
         };
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("pending"));
@@ -261,5 +305,45 @@ mod tests {
         assert!(!config.enabled);
         let rules = state.routing_rules.try_read().unwrap();
         assert!(rules.is_empty());
+    }
+
+    #[test]
+    fn session_goal_serialize() {
+        let g = SessionGoal {
+            session_id: "sess-1".to_string(),
+            goal: "Refactor auth module".to_string(),
+            refined_goal: None,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_string(&g).unwrap();
+        assert!(json.contains("Refactor auth module"));
+    }
+
+    #[test]
+    fn supervisor_analysis_serialize() {
+        let a = SupervisorAnalysis {
+            id: "a1".to_string(),
+            session_id: "s1".to_string(),
+            analyzed_at: "2024-01-01T00:00:00Z".to_string(),
+            last_request_id: Some("r1".to_string()),
+            goal_alignment_score: Some(0.8),
+            efficiency_score: Some(0.7),
+            intent_execution_match: None,
+            token_summary: None,
+            issues: None,
+            recommendation: Some("Keep going".to_string()),
+            raw_llm_response: None,
+            discord_sent: false,
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(json.contains("0.8"));
+        assert!(json.contains("Keep going"));
+    }
+
+    #[test]
+    fn appstate_has_supervisor_fields() {
+        let state = make_state("http://mock");
+        assert!(!state.supervisor_analyzing.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

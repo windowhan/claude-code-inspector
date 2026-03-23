@@ -26,6 +26,13 @@ pub async fn handle_request(
     peer_addr: SocketAddr,
     session_cache: SessionCache,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // CONNECT tunneling is not supported (Cursor MITM removed in favour of DB watcher)
+    if req.method() == hyper::Method::CONNECT {
+        return Ok(Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Full::new(Bytes::from("CONNECT not supported")))
+            .unwrap());
+    }
     match handle_inner(req, Arc::clone(&state), peer_addr, session_cache).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
@@ -187,6 +194,8 @@ async fn handle_inner(
         agent_task: agent_task.clone(),
         routing_category: String::new(),
         routed_to_url: String::new(),
+        source: "claude_code".to_string(),
+        target_host: "api.anthropic.com".to_string(),
     };
 
     {
@@ -761,7 +770,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let db = state.db.lock().await;
-        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].status, "complete");
         assert_eq!(reqs[0].input_tokens, Some(10));
@@ -787,7 +796,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let db = state.db.lock().await;
-        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 1);
 
         // x-api-key must NOT appear in stored headers
@@ -814,7 +823,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let db = state.db.lock().await;
-        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
         assert_eq!(reqs[0].status, "error");
         assert_eq!(reqs[0].response_status, Some(401));
     }
@@ -843,7 +852,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let db = state.db.lock().await;
-        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 1);
         assert!(reqs[0].is_streaming);
         assert_eq!(reqs[0].status, "complete");
@@ -913,7 +922,7 @@ mod tests {
         // Check it's in intercepted state
         {
             let db = state.db.lock().await;
-            let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+            let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].status, "intercepted");
         }
@@ -968,7 +977,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let db = state.db.lock().await;
-        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
         assert_eq!(reqs[0].status, "rejected");
     }
 
@@ -1135,7 +1144,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         let db = state.db.lock().await;
-        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 1);
         // routing_category should be empty when routing is disabled
         assert_eq!(reqs[0].routing_category, "");
@@ -1206,7 +1215,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let db = state.db.lock().await;
-        let reqs = db::get_requests(&db, None, 10, 0).unwrap();
+        let reqs = db::get_requests(&db, None, None, 10, 0).unwrap();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].routing_category, "code_gen");
     }

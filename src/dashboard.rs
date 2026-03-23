@@ -14,6 +14,7 @@ use crate::functions;
 use crate::intercept;
 use crate::routing;
 use crate::supervisor;
+use crate::supervisor_llm;
 use crate::types::{AppState, InterceptAction, RoutingConfig, RoutingRule};
 
 // A boxed body type that can be either Full<Bytes> or a streaming body
@@ -111,6 +112,26 @@ pub async fn handle_dashboard(
         ("GET", p) if p.starts_with("/api/supervisor/patterns/") => {
             let sid = p.trim_start_matches("/api/supervisor/patterns/");
             full_to_box(serve_supervisor_patterns(&state, sid).await)
+        }
+        // Supervisor LLM API
+        ("GET", "/api/supervisor/config") => full_to_box(serve_supervisor_config_get(&state).await),
+        ("POST", "/api/supervisor/config") => full_to_box(serve_supervisor_config_save(Arc::clone(&state), request_body.as_deref().unwrap_or(&[])).await),
+        ("GET", p) if p.starts_with("/api/supervisor/goals/") => {
+            let sid = p.trim_start_matches("/api/supervisor/goals/");
+            full_to_box(serve_supervisor_goal_get(&state, sid).await)
+        }
+        ("POST", p) if p.starts_with("/api/supervisor/goals/") => {
+            let sid = p.trim_start_matches("/api/supervisor/goals/");
+            full_to_box(serve_supervisor_goal_set(&state, sid, request_body.as_deref().unwrap_or(&[])).await)
+        }
+        ("DELETE", p) if p.starts_with("/api/supervisor/goals/") => {
+            let sid = p.trim_start_matches("/api/supervisor/goals/");
+            full_to_box(serve_supervisor_goal_delete(&state, sid).await)
+        }
+        ("POST", "/api/supervisor/refine-goal") => full_to_box(serve_supervisor_refine_goal(&state, request_body.as_deref().unwrap_or(&[])).await),
+        ("GET", p) if p.starts_with("/api/supervisor/analyses/") => {
+            let sid = p.trim_start_matches("/api/supervisor/analyses/");
+            full_to_box(serve_supervisor_analyses(&state, sid, &query).await)
         }
         // Summarizer API
         ("GET", "/api/summarizer/config") => full_to_box(serve_summarizer_config_get(&state).await),
@@ -216,6 +237,7 @@ async fn serve_requests(state: &AppState, query: &str) -> Response<Full<Bytes>> 
     let offset     = params.get("offset").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
     let starred    = params.get("starred").map(|v| v == "1" || v == "true").unwrap_or(false);
     let search     = params.get("search").cloned().unwrap_or_default();
+    let source     = params.get("source").map(|s| s.as_str()).filter(|s| !s.is_empty());
 
     let db = state.db.lock().await;
     if starred {
@@ -229,7 +251,7 @@ async fn serve_requests(state: &AppState, query: &str) -> Response<Full<Bytes>> 
             Err(e) => { warn!("search_requests: {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
         }
     } else {
-        match db::get_requests(&db, session_id, limit, offset) {
+        match db::get_requests(&db, session_id, source, limit, offset) {
             Ok(r)  => json_response(serde_json::to_value(&r).unwrap_or_default()),
             Err(e) => { warn!("get_requests: {e}"); json_response(serde_json::json!({"error": e.to_string()})) }
         }
@@ -534,7 +556,7 @@ async fn serve_supervisor_summary(state: &AppState, session_id: &str) -> Respons
         }
     }
 
-    match db::get_requests(&db, Some(session_id), 10000, 0) {
+    match db::get_requests(&db, Some(session_id), None, 10000, 0) {
         Ok(reqs) => {
             let summary = supervisor::build_session_summary(&reqs);
             let text = serde_json::to_string(&summary).unwrap_or_default();
@@ -674,13 +696,167 @@ async fn serve_supervisor_patterns(state: &AppState, session_id: &str) -> Respon
         }
     }
 
-    let reqs = db::get_requests(&db, Some(session_id), 10000, 0).unwrap_or_default();
+    let reqs = db::get_requests(&db, Some(session_id), None, 10000, 0).unwrap_or_default();
     let accesses = db::get_file_access_by_session(&db, session_id).unwrap_or_default();
     let patterns = supervisor::detect_patterns(&reqs, &accesses);
     let result = supervisor::patterns_to_json(&patterns);
     let text = serde_json::to_string(&result).unwrap_or_default();
     let _ = db::set_supervisor_cache(&db, session_id, "detect_patterns", req_count, pending_count, &text);
     json_response(result)
+}
+
+// ── Supervisor LLM API ────────────────────────────────────────────────────────
+
+async fn serve_supervisor_config_get(state: &AppState) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    let config = db::get_supervisor_config(&db).unwrap_or_default();
+    // Never return api_key plaintext — expose only a boolean presence flag
+    let safe = serde_json::json!({
+        "enabled": config.enabled,
+        "provider": config.provider,
+        "base_url": config.base_url,
+        "api_key_set": !config.api_key.is_empty(),
+        "model": config.model,
+        "interval_minutes": config.interval_minutes,
+        "discord_webhook_url": config.discord_webhook_url,
+    });
+    json_response(safe)
+}
+
+async fn serve_supervisor_config_save(state: Arc<AppState>, body: &[u8]) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error("Invalid JSON"),
+    };
+
+    let mut config = {
+        let db = state.db.lock().await;
+        db::get_supervisor_config(&db).unwrap_or_default()
+    };
+
+    if let Some(v) = val.get("enabled").and_then(|v| v.as_bool()) { config.enabled = v; }
+    if let Some(v) = val.get("provider").and_then(|v| v.as_str()) { config.provider = v.to_string(); }
+    if let Some(v) = val.get("base_url").and_then(|v| v.as_str()) { config.base_url = v.to_string(); }
+    if let Some(v) = val.get("api_key").and_then(|v| v.as_str()) { config.api_key = v.to_string(); }
+    if let Some(v) = val.get("model").and_then(|v| v.as_str()) { config.model = v.to_string(); }
+    if let Some(v) = val.get("interval_minutes").and_then(|v| v.as_i64()) { config.interval_minutes = v; }
+    if let Some(v) = val.get("discord_webhook_url").and_then(|v| v.as_str()) {
+        if !v.is_empty() && !v.starts_with("https://discord.com/api/webhooks/") {
+            return json_error("discord_webhook_url must start with https://discord.com/api/webhooks/");
+        }
+        config.discord_webhook_url = v.to_string();
+    }
+
+    {
+        let db = state.db.lock().await;
+        if let Err(e) = db::save_supervisor_config(&db, &config) {
+            return json_error(&e.to_string());
+        }
+    }
+
+    // Abort existing supervisor task and restart if config is active
+    {
+        let mut handle = state.supervisor_handle.lock().await;
+        if let Some(h) = handle.take() {
+            h.abort();
+        }
+        let is_active = config.enabled && !config.api_key.is_empty();
+        if is_active {
+            let state_clone = Arc::clone(&state);
+            *handle = Some(tokio::spawn(async move {
+                supervisor_llm::run_supervisor_loop(state_clone).await;
+            }));
+            tracing::info!("Supervisor LLM task started via config save");
+        }
+    }
+
+    json_response(serde_json::json!({"ok": true}))
+}
+
+async fn serve_supervisor_goal_get(state: &AppState, session_id: &str) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    match db::get_session_goal(&db, session_id) {
+        Ok(Some(goal)) => json_response(serde_json::to_value(&goal).unwrap_or_default()),
+        Ok(None) => Response::builder()
+            .status(404)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(r#"{"error":"Not found"}"#)))
+            .unwrap(),
+        Err(e) => json_error(&e.to_string()),
+    }
+}
+
+async fn serve_supervisor_goal_set(state: &AppState, session_id: &str, body: &[u8]) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error("Invalid JSON"),
+    };
+    let goal = match val.get("goal").and_then(|v| v.as_str()) {
+        Some(g) => g.chars().take(500).collect::<String>(),
+        None => return json_error("Missing 'goal' field"),
+    };
+    let refined_goal = val.get("refined_goal").and_then(|v| v.as_str())
+        .map(|s| s.chars().take(500).collect::<String>());
+
+    let db = state.db.lock().await;
+    match db::set_session_goal(&db, session_id, &goal, refined_goal.as_deref()) {
+        Ok(()) => json_response(serde_json::json!({"ok": true})),
+        Err(e) => json_error(&e.to_string()),
+    }
+}
+
+async fn serve_supervisor_goal_delete(state: &AppState, session_id: &str) -> Response<Full<Bytes>> {
+    let db = state.db.lock().await;
+    match db::delete_session_goal(&db, session_id) {
+        Ok(()) => json_response(serde_json::json!({"ok": true})),
+        Err(e) => json_error(&e.to_string()),
+    }
+}
+
+async fn serve_supervisor_refine_goal(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
+    let val: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return json_error("Invalid JSON"),
+    };
+    let goal_text = match val.get("goal").and_then(|v| v.as_str()) {
+        Some(g) => g.chars().take(500).collect::<String>(),
+        None => return json_error("Missing 'goal' field"),
+    };
+
+    let config = {
+        let db = state.db.lock().await;
+        db::get_supervisor_config(&db).unwrap_or_default()
+    };
+
+    if config.api_key.is_empty() {
+        return json_error("Supervisor not configured. Set API key in Supervisor settings.");
+    }
+
+    let llm_config = crate::llm::LlmConfig {
+        provider: config.provider,
+        base_url: config.base_url,
+        api_key: config.api_key,
+        model: config.model,
+    };
+
+    match supervisor_llm::refine_goal(&llm_config, &goal_text).await {
+        Ok(refinement) => json_response(serde_json::to_value(&refinement).unwrap_or_default()),
+        Err(e) => json_error(&format!("Goal refinement failed: {e}")),
+    }
+}
+
+async fn serve_supervisor_analyses(state: &AppState, session_id: &str, query: &str) -> Response<Full<Bytes>> {
+    let limit = query.split('&')
+        .find(|p| p.starts_with("limit="))
+        .and_then(|p| p.trim_start_matches("limit=").parse::<i64>().ok())
+        .unwrap_or(10)
+        .clamp(1, 100);
+
+    let db = state.db.lock().await;
+    match db::get_supervisor_analyses(&db, session_id, limit) {
+        Ok(analyses) => json_response(serde_json::to_value(&analyses).unwrap_or_default()),
+        Err(e) => json_error(&e.to_string()),
+    }
 }
 
 // ── Summarizer API handlers ───────────────────────────────────────────────────
@@ -777,88 +953,17 @@ async fn serve_summarize(state: &AppState, body: &[u8]) -> Response<Full<Bytes>>
         ));
     }
 
-    // Call LLM with provider-specific format
-    let client = reqwest::Client::new();
-    let is_anthropic = config.provider == "anthropic";
-    // OpenAI-compatible: openai, deepseek, kimi
-    // Anthropic: anthropic
-
-    let (url, api_body, auth_header) = if is_anthropic {
-        (
-            format!("{}/v1/messages", config.base_url),
-            serde_json::json!({
-                "model": config.model,
-                "max_tokens": 1024,
-                "messages": [{"role": "user", "content": context}],
-            }),
-            ("x-api-key", config.api_key.clone()),
-        )
-    } else {
-        // OpenAI-compatible format (deepseek, openai, kimi)
-        let path = if config.provider == "kimi" {
-            format!("{}/v1/chat/completions", config.base_url)
-        } else {
-            format!("{}/v1/chat/completions", config.base_url)
-        };
-        (
-            path,
-            serde_json::json!({
-                "model": config.model,
-                "max_tokens": 1024,
-                "messages": [{"role": "user", "content": context}],
-            }),
-            ("authorization", format!("Bearer {}", config.api_key)),
-        )
+    let llm_config = crate::llm::LlmConfig {
+        provider: config.provider.clone(),
+        base_url: config.base_url.clone(),
+        api_key: config.api_key.clone(),
+        model: config.model.clone(),
     };
 
-    let mut req_builder = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header(auth_header.0, &auth_header.1);
-
-    if is_anthropic {
-        req_builder = req_builder.header("anthropic-version", "2023-06-01");
+    match crate::llm::call_llm(&llm_config, None, &context, 1024).await {
+        Ok(summary) => json_response(serde_json::json!({"summary": summary})),
+        Err(e) => json_error(&e),
     }
-
-    let resp: reqwest::Response = match req_builder
-        .body(serde_json::to_string(&api_body).unwrap_or_default())
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return json_error(&format!("LLM request failed: {e}")),
-    };
-
-    let resp_text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => return json_error(&format!("LLM response read failed: {e}")),
-    };
-    let resp_json: serde_json::Value = match serde_json::from_str(&resp_text) {
-        Ok(j) => j,
-        Err(e) => return json_error(&format!("LLM response parse failed: {e} — raw: {}", truncate(&resp_text, 200))),
-    };
-
-    // Parse response based on provider format
-    let summary = if is_anthropic {
-        // Anthropic: { content: [{ text: "..." }] }
-        resp_json.get("content")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|b| b.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("No summary generated")
-    } else {
-        // OpenAI-compatible: { choices: [{ message: { content: "..." } }] }
-        resp_json.get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("No summary generated")
-    };
-
-    json_response(serde_json::json!({"summary": summary}))
 }
 
 async fn serve_summarizer_models(state: &AppState, body: &[u8]) -> Response<Full<Bytes>> {
@@ -1008,6 +1113,7 @@ fn extract_response_text(response_body: &str) -> String {
     String::new()
 }
 
+#[allow(dead_code)]
 fn truncate(s: &str, max: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max { s.to_string() } else { format!("{}…", chars[..max].iter().collect::<String>()) }
@@ -1282,6 +1388,8 @@ mod tests {
             agent_task: String::new(),
             routing_category: String::new(),
             routed_to_url: String::new(),
+            source: "claude_code".to_string(),
+            target_host: "api.anthropic.com".to_string(),
         }).unwrap();
         // Populate the response fields (insert_request only stores base fields)
         db::update_request_complete(&db, req_id, 200, "{}", "{}", Some(5), Some(3), 100, "complete").unwrap();
@@ -1571,6 +1679,8 @@ mod tests {
                 agent_task: String::new(),
                 routing_category: String::new(),
                 routed_to_url: String::new(),
+                source: "claude_code".to_string(),
+                target_host: "api.anthropic.com".to_string(),
             }).unwrap();
         }
         seed_request(&state, "r-other", &sid);

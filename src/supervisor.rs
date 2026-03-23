@@ -753,6 +753,8 @@ mod tests {
             agent_task: String::new(),
             routing_category: String::new(),
             routed_to_url: String::new(),
+            source: "claude_code".to_string(),
+            target_host: "api.anthropic.com".to_string(),
         }
     }
 

@@ -164,7 +164,7 @@ async fn handle_list_requests(state: &AppState, params: Option<&Value>) -> Value
     let offset = params.and_then(|p| p.get("offset")).and_then(|v| v.as_i64()).unwrap_or(0);
 
     let db = state.db.lock().await;
-    match db::get_requests(&db, session_id.as_deref(), limit, offset) {
+    match db::get_requests(&db, session_id.as_deref(), None, limit, offset) {
         Ok(reqs) => {
             let summary: Vec<Value> = reqs.iter().map(|r| json!({
                 "id": r.id,
@@ -259,7 +259,7 @@ async fn handle_session_summary(state: &AppState, params: Option<&Value>) -> Val
     }
 
     // Compute
-    match db::get_requests(&db, Some(&session_id), 10000, 0) {
+    match db::get_requests(&db, Some(&session_id), None, 10000, 0) {
         Ok(reqs) => {
             let summary = supervisor::build_session_summary(&reqs);
             let text = serde_json::to_string_pretty(&summary).unwrap_or_default();
@@ -356,7 +356,7 @@ async fn handle_detect_patterns(state: &AppState, params: Option<&Value>) -> Val
         return json!({ "content": [{ "type": "text", "text": cached }] });
     }
 
-    let reqs = db::get_requests(&db, Some(&session_id), 10000, 0).unwrap_or_default();
+    let reqs = db::get_requests(&db, Some(&session_id), None, 10000, 0).unwrap_or_default();
     let accesses = db::get_file_access_by_session(&db, &session_id).unwrap_or_default();
     let patterns = supervisor::detect_patterns(&reqs, &accesses);
     let result = supervisor::patterns_to_json(&patterns);
@@ -510,6 +510,8 @@ mod tests {
             agent_task: String::new(),
             routing_category: String::new(),
             routed_to_url: String::new(),
+            source: "claude_code".to_string(),
+            target_host: "api.anthropic.com".to_string(),
         }).unwrap();
         // Populate response fields (insert_request only stores base fields)
         db::update_request_complete(
