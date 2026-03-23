@@ -622,6 +622,16 @@ pre.resp-code { max-height: none; }
 .cv-req-details summary:hover { color: var(--text-bright); }
 .cv-req-pre { font-size: 11px; max-height: 300px; overflow: auto; background: var(--bg); border: 1px solid var(--border2); border-radius: 4px; padding: 8px; margin-top: 4px; white-space: pre-wrap; word-break: break-all; color: var(--text); }
 .cv-req-raw { max-height: 500px; font-size: 10px; color: var(--text-muted); }
+.cv-req-md { font-size: 12px; max-height: 500px; overflow: auto; background: var(--bg); border: 1px solid var(--border2); border-radius: 4px; padding: 10px 12px; margin-top: 4px; color: var(--text); line-height: 1.6; }
+.cv-req-md p { margin: 0 0 8px; }
+.cv-req-md h1,.cv-req-md h2,.cv-req-md h3 { font-size: 13px; font-weight: 600; margin: 10px 0 4px; color: var(--text-bright); }
+.cv-req-md code { background: var(--bg2); border-radius: 3px; padding: 1px 4px; font-family: monospace; font-size: 11px; }
+.cv-req-md pre { background: var(--bg2); border-radius: 4px; padding: 8px; overflow: auto; margin: 6px 0; }
+.cv-req-md pre code { background: none; padding: 0; }
+.cv-req-md ul,.cv-req-md ol { padding-left: 18px; margin: 4px 0; }
+.cv-req-md li { margin: 2px 0; }
+.cv-req-md strong { color: var(--text-bright); }
+.cv-req-md blockquote { border-left: 3px solid var(--border2); margin: 4px 0; padding-left: 10px; color: var(--text-muted); }
 
 /* ── Source filter ──────────────────────────────────────────────────────────── */
 .req-panel-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

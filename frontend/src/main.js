@@ -1,5 +1,6 @@
 import { getSessions, getRequests, getRequestDetail, connectEvents, deleteSession, toggleStar, setMemo, getInterceptStatus, toggleIntercept, forwardOriginal, forwardModified, rejectRequest, getRoutingConfig, saveRoutingConfig, getRoutingRules, createRoutingRule, updateRoutingRule, deleteRoutingRule, reorderRoutingRules, testRoutingClassifier, getSessionSummary, getFileCoverage, getDetectPatterns, getFileTree, getFileContent, getFileRequests, getSupervisorConfig, saveSupervisorConfig, getSessionGoal, setSessionGoal, deleteSessionGoal, refineGoal, getSupervisorAnalyses } from './api.js'
 import { projectColor, fmtTime, fmtTokens, fmtDuration, fmtBytes, esc, prettyJson, statusIcon } from './utils.js'
+import { marked } from 'marked'
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let sessions = []
@@ -851,7 +852,7 @@ function renderTimeline(lineNum, requests) {
       <div class="cv-req-meta">${r.input_tokens ?? '-'} in / ${r.output_tokens ?? '-'} out${r.duration_ms ? ' · ' + r.duration_ms + 'ms' : ''}</div>
       <details class="cv-req-details"><summary>Prompt</summary><pre class="cv-req-pre">${esc(formatPrompt(r.request_body, prevReqBody))}</pre></details>
       <details class="cv-req-details"><summary>Raw Prompt</summary><pre class="cv-req-pre cv-req-raw">${esc(formatRawPrompt(r.request_body))}</pre></details>
-      <details class="cv-req-details"><summary>Response</summary><pre class="cv-req-pre">${esc(formatResponse(r.response_body))}</pre></details>
+      <details class="cv-req-details"><summary>Response</summary><div class="cv-req-md">${marked.parse(formatResponse(r.response_body))}</div></details>
       <details class="cv-req-details"><summary>Raw Response</summary><pre class="cv-req-pre cv-req-raw">${esc(formatRawResponse(r.response_body))}</pre></details>
     </div>`
   }
@@ -2355,7 +2356,10 @@ async function init() {
   connectEvents((e) => {
     // Debounce session/request list refresh (500ms)
     clearTimeout(sseRefreshTimer)
-    sseRefreshTimer = setTimeout(() => { loadSessions(); loadRequests() }, 500)
+    sseRefreshTimer = setTimeout(() => {
+      // Skip re-render while code viewer is open to avoid resetting scroll/selection
+      if (!codeViewerActive) { loadSessions(); loadRequests() }
+    }, 500)
 
     let eventRequestId = null
     try { eventRequestId = JSON.parse(e.data)?.data?.id } catch (_) {}
