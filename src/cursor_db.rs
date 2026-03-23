@@ -17,7 +17,7 @@ use tokio::time::{Duration, interval};
 use tracing::{debug, warn};
 
 use crate::db;
-use crate::types::{AppState, RequestRecord, SessionRecord};
+use crate::types::{AppState, DashboardEvent, RequestRecord, SessionRecord};
 
 const POLL_INTERVAL_SECS: u64 = 3;
 
@@ -390,15 +390,23 @@ pub async fn watch(state: Arc<AppState>) {
                                     .token_count
                                     .as_ref()
                                     .map(|t| t.output_tokens);
-                                if let Err(e) = db::update_cursor_response(
+                                match db::update_cursor_response(
                                     &db,
                                     user_bubble_id,
                                     &resp_json,
                                     output_tokens,
                                 ) {
-                                    warn!(
-                                        "cursor_db: update_cursor_response {user_bubble_id}: {e}"
-                                    );
+                                    Ok(()) => {
+                                        let _ = state.event_tx.send(DashboardEvent {
+                                            event_type: "request_update".to_string(),
+                                            data: serde_json::json!({ "id": user_bubble_id }),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "cursor_db: update_cursor_response {user_bubble_id}: {e}"
+                                        );
+                                    }
                                 }
                             }
                         }
