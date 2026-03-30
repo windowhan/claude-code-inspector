@@ -308,6 +308,23 @@ pub fn update_cursor_response(
     Ok(())
 }
 
+/// Find the most recent pending Cursor request for a given conversation_id
+/// (stored in agent_task field). Returns the request id if found.
+pub fn find_pending_cursor_request_by_conversation(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM requests WHERE source = 'cursor' AND agent_task = ?1 AND status = 'pending' ORDER BY timestamp DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![conversation_id])?;
+    if let Some(row) = rows.next()? {
+        Ok(Some(row.get(0)?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Delete a session and all its requests, file access records, and cached analyses.
 pub fn delete_session(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM file_access WHERE session_id = ?1", params![id])?;
@@ -1834,5 +1851,61 @@ mod tests {
         assert!(ids.contains(&"sess-b"));
         let b = goals.iter().find(|g| g.session_id == "sess-b").unwrap();
         assert_eq!(b.refined_goal.as_deref(), Some("Refined B"));
+    }
+
+    #[test]
+    fn find_pending_cursor_request_by_conversation_found() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        let mut req = sample_request("bubble-user-1", "s1");
+        req.source = "cursor".to_string();
+        req.status = "pending".to_string();
+        req.agent_task = "conv-abc".to_string();
+        insert_request(&conn, &req).unwrap();
+
+        let result = find_pending_cursor_request_by_conversation(&conn, "conv-abc").unwrap();
+        assert_eq!(result, Some("bubble-user-1".to_string()));
+    }
+
+    #[test]
+    fn find_pending_cursor_request_by_conversation_not_found() {
+        let conn = setup();
+        let result = find_pending_cursor_request_by_conversation(&conn, "no-such-conv").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_pending_cursor_request_ignores_completed() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        let mut req = sample_request("bubble-user-2", "s1");
+        req.source = "cursor".to_string();
+        req.status = "complete".to_string();
+        req.agent_task = "conv-xyz".to_string();
+        insert_request(&conn, &req).unwrap();
+
+        let result = find_pending_cursor_request_by_conversation(&conn, "conv-xyz").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_pending_cursor_request_returns_most_recent() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        let mut r1 = sample_request("bubble-old", "s1");
+        r1.source = "cursor".to_string();
+        r1.status = "pending".to_string();
+        r1.agent_task = "conv-multi".to_string();
+        r1.timestamp = "2024-01-01T00:00:00Z".to_string();
+        insert_request(&conn, &r1).unwrap();
+        let mut r2 = sample_request("bubble-new", "s1");
+        r2.source = "cursor".to_string();
+        r2.status = "pending".to_string();
+        r2.agent_task = "conv-multi".to_string();
+        r2.timestamp = "2024-01-02T00:00:00Z".to_string();
+        insert_request(&conn, &r2).unwrap();
+
+        let result = find_pending_cursor_request_by_conversation(&conn, "conv-multi").unwrap();
+        assert_eq!(result, Some("bubble-new".to_string()));
     }
 }

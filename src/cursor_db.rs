@@ -252,6 +252,14 @@ pub async fn watch(state: Arc<AppState>) {
 
             match serde_json::from_str::<Bubble>(value) {
                 Ok(bubble) => {
+                    // Don't mark incomplete AI response bubbles as seen — Cursor may still
+                    // be streaming the response. We'll retry next tick until text arrives.
+                    if bubble.bubble_type == 2
+                        && bubble.text.is_empty()
+                        && bubble.tool_former_data.is_none()
+                    {
+                        continue;
+                    }
                     seen.insert(dedup_key);
                     new_bubbles.push((conversation_id.to_string(), bubble_id.to_string(), bubble));
                 }
@@ -314,7 +322,8 @@ pub async fn watch(state: Arc<AppState>) {
                         starred: false,
                         memo: String::new(),
                         agent_type: "cursor".to_string(),
-                        agent_task: String::new(),
+                        // Store conversation_id so we can recover matches after restart
+                        agent_task: conversation_id.clone(),
                         routing_category: String::new(),
                         routed_to_url: String::new(),
                         source: "cursor".to_string(),
@@ -405,31 +414,47 @@ pub async fn watch(state: Arc<AppState>) {
                         let resp_json = serde_json::to_string(&timeline)
                             .unwrap_or_else(|_| bubble.text.clone());
 
-                        if let Some(user_bubbles) = conv_user_bubbles.get(&conversation_id) {
-                            if let Some(user_bubble_id) = user_bubbles.last() {
-                                let output_tokens = bubble
-                                    .token_count
-                                    .as_ref()
-                                    .map(|t| t.output_tokens);
-                                match db::update_cursor_response(
+                        // Try in-memory map first; fall back to DB query for conversations
+                        // we haven't seen in this session (e.g. after server restart).
+                        let user_bubble_id: Option<String> = conv_user_bubbles
+                            .get(&conversation_id)
+                            .and_then(|v| v.last())
+                            .cloned()
+                            .or_else(|| {
+                                db::find_pending_cursor_request_by_conversation(
                                     &db,
-                                    user_bubble_id,
-                                    &resp_json,
-                                    output_tokens,
-                                ) {
-                                    Ok(()) => {
-                                        let _ = state.event_tx.send(DashboardEvent {
-                                            event_type: "request_update".to_string(),
-                                            data: serde_json::json!({ "id": user_bubble_id }),
-                                        });
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            "cursor_db: update_cursor_response {user_bubble_id}: {e}"
-                                        );
-                                    }
+                                    &conversation_id,
+                                )
+                                .unwrap_or(None)
+                            });
+
+                        if let Some(user_bubble_id) = user_bubble_id {
+                            let output_tokens = bubble
+                                .token_count
+                                .as_ref()
+                                .map(|t| t.output_tokens);
+                            match db::update_cursor_response(
+                                &db,
+                                &user_bubble_id,
+                                &resp_json,
+                                output_tokens,
+                            ) {
+                                Ok(()) => {
+                                    let _ = state.event_tx.send(DashboardEvent {
+                                        event_type: "request_update".to_string(),
+                                        data: serde_json::json!({ "id": user_bubble_id }),
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "cursor_db: update_cursor_response {user_bubble_id}: {e}"
+                                    );
                                 }
                             }
+                        } else {
+                            warn!(
+                                "cursor_db: no pending request for conversation {conversation_id} (bubble {bubble_id})"
+                            );
                         }
                     }
                 }
