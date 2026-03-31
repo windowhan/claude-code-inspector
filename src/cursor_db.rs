@@ -118,44 +118,107 @@ fn fetch_bubble_keys(db_path: &PathBuf) -> Vec<(String, String)> {
     }
 }
 
-/// Given a Cursor PID, find the active workspace path via lsof.
-/// Looks for lines matching `workspaceStorage/*/state.vscdb` in lsof output,
-/// then reads the workspace.json to get the folder.
-fn find_workspace_for_pid(pid: u32) -> Option<(String, String)> {
-    let output = std::process::Command::new("lsof")
+/// Given a Cursor PID, find all active workspace paths via lsof.
+/// Each Cursor window opens its own workspaceStorage/*/state.vscdb.
+/// Returns Vec of (cwd, project_name, workspace_storage_db_path).
+fn find_workspaces_for_pid(pid: u32) -> Vec<(String, String, PathBuf)> {
+    let output = match std::process::Command::new("lsof")
         .args(["-p", &pid.to_string()])
         .output()
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let ws_path = stdout
-        .lines()
-        .find(|l| l.contains("workspaceStorage") && l.ends_with("state.vscdb"))?;
-
-    // Extract path from lsof line — path starts at the first '/' after the columns.
-    // Can't use split_whitespace().last() because "Application Support" has a space.
-    let db_file = ws_path.find('/').map(|i| &ws_path[i..])?.trim();
-    let db_path = std::path::Path::new(db_file);
-    let hash_dir = db_path.parent()?;
-    let workspace_json = hash_dir.join("workspace.json");
-
-    let content = std::fs::read_to_string(&workspace_json).ok()?;
-    let v: Value = serde_json::from_str(&content).ok()?;
-    let folder = v.get("folder")?.as_str()?.to_string();
-
-    // Strip "file://" prefix if present
-    let folder = if folder.starts_with("file://") {
-        folder[7..].to_string()
-    } else {
-        folder
+    {
+        Ok(o) => o,
+        Err(_) => return vec![],
     };
 
-    let project_name = std::path::Path::new(&folder)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| folder.clone());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut results = vec![];
 
-    Some((folder, project_name))
+    for line in stdout.lines() {
+        if !line.contains("workspaceStorage") || !line.ends_with("state.vscdb") {
+            continue;
+        }
+        // Extract path from lsof line — starts at first '/', rest may have spaces.
+        let db_file = match line.find('/').map(|i| line[i..].trim()) {
+            Some(f) => f,
+            None => continue,
+        };
+        let db_path = std::path::Path::new(db_file);
+        let hash_dir = match db_path.parent() {
+            Some(d) => d,
+            None => continue,
+        };
+        let workspace_json = hash_dir.join("workspace.json");
+        let content = match std::fs::read_to_string(&workspace_json) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let v: Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let folder = match v.get("folder").and_then(|f| f.as_str()) {
+            Some(f) => f.to_string(),
+            None => continue,
+        };
+        let folder = if folder.starts_with("file://") {
+            folder[7..].to_string()
+        } else {
+            folder
+        };
+        let project_name = std::path::Path::new(&folder)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| folder.clone());
+        results.push((folder, project_name, db_path.to_path_buf()));
+    }
+    results
+}
+
+/// Read all composerIds from a workspace-specific storage DB connection.
+/// ComposerIds in workspace storage == conversation_ids in global bubbleId keys.
+fn fetch_composer_ids_from_conn(conn: &SqliteConn) -> Vec<String> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = 'composer.composerData'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let value = match value {
+        Some(v) => v,
+        None => return vec![],
+    };
+
+    let json: Value = match serde_json::from_str(&value) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    json.get("allComposers")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    c.get("composerId")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read all composerIds from a workspace-specific storage DB file.
+fn fetch_composer_ids_for_workspace(ws_db: &PathBuf) -> Vec<String> {
+    let conn = match SqliteConn::open_with_flags(
+        ws_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    fetch_composer_ids_from_conn(&conn)
 }
 
 /// Derive a stable session_id from the workspace CWD.
@@ -199,18 +262,27 @@ pub async fn watch(state: Arc<AppState>) {
         }
 
         // Collect unique workspaces across all PIDs (multiple Cursor processes share one workspace)
-        let mut workspaces: Vec<(String, String, u32)> = vec![]; // (cwd, project_name, first_pid)
+        // Entry: (cwd, project_name, first_pid, ws_storage_db_path)
+        let mut workspaces: Vec<(String, String, u32, PathBuf)> = vec![];
         for &pid in &pids {
-            let (cwd, project_name) = find_workspace_for_pid(pid)
-                .unwrap_or_else(|| (String::new(), format!("Cursor (pid {pid})")));
-            // Deduplicate by cwd — only keep first PID per workspace
-            if !workspaces.iter().any(|(w, _, _)| *w == cwd) {
-                workspaces.push((cwd, project_name, pid));
+            let found = find_workspaces_for_pid(pid);
+            if found.is_empty() {
+                let cwd = String::new();
+                let name = format!("Cursor (pid {pid})");
+                if !workspaces.iter().any(|(w, _, _, _)| *w == cwd) {
+                    workspaces.push((cwd, name, pid, PathBuf::new()));
+                }
+            } else {
+                for (cwd, project_name, ws_db) in found {
+                    if !workspaces.iter().any(|(w, _, _, _)| *w == cwd) {
+                        workspaces.push((cwd, project_name, pid, ws_db));
+                    }
+                }
             }
         }
 
         // Upsert one session per unique workspace, using a stable cwd-based session_id
-        for (cwd, project_name, pid) in &workspaces {
+        for (cwd, project_name, pid, _) in &workspaces {
             let session_id = workspace_session_id(cwd, *pid);
             let session = SessionRecord {
                 id: session_id.clone(),
@@ -226,10 +298,25 @@ pub async fn watch(state: Arc<AppState>) {
             }
         }
 
-        // Use the first workspace's session_id and cwd for bubble attribution
+        // Build conversation_id → (session_id, cwd) from each workspace's composerData.
+        // ComposerIds in workspace storage == conversation_ids in global bubbleId keys.
+        let mut conv_to_session: HashMap<String, String> = HashMap::new();
+        let mut conv_to_cwd: HashMap<String, String> = HashMap::new();
+        for (cwd, _, pid, ws_db) in &workspaces {
+            if ws_db.as_os_str().is_empty() {
+                continue;
+            }
+            let session_id = workspace_session_id(cwd, *pid);
+            for conv_id in fetch_composer_ids_for_workspace(ws_db) {
+                conv_to_session.insert(conv_id.clone(), session_id.clone());
+                conv_to_cwd.insert(conv_id, cwd.clone());
+            }
+        }
+
+        // Fallback: first workspace's session_id and cwd for unrecognized conversations
         let (primary_cwd, primary_session_id) = workspaces
             .first()
-            .map(|(cwd, _, pid)| (cwd.clone(), workspace_session_id(cwd, *pid)))
+            .map(|(cwd, _, pid, _)| (cwd.clone(), workspace_session_id(cwd, *pid)))
             .unwrap_or_else(|| (String::new(), "cursor-unknown".to_string()));
 
         // Fetch all bubble keys
@@ -274,11 +361,19 @@ pub async fn watch(state: Arc<AppState>) {
             continue;
         }
 
-        let session_id = primary_session_id;
-
         let db = state.db.lock().await;
 
         for (conversation_id, bubble_id, bubble) in new_bubbles {
+            // Resolve session_id and cwd for this conversation; fall back to primary workspace.
+            let session_id = conv_to_session
+                .get(&conversation_id)
+                .cloned()
+                .unwrap_or_else(|| primary_session_id.clone());
+            let conv_cwd = conv_to_cwd
+                .get(&conversation_id)
+                .cloned()
+                .unwrap_or_else(|| primary_cwd.clone());
+
             match bubble.bubble_type {
                 1 => {
                     // User message → insert as RequestRecord
@@ -371,11 +466,11 @@ pub async fn watch(state: Arc<AppState>) {
                                             _ => String::new(),
                                         }
                                     };
-                                    // Resolve relative paths to absolute using workspace CWD
+                                    // Resolve relative paths to absolute using this conversation's CWD
                                     let abs_path = if path.starts_with('/') {
                                         path.to_string()
-                                    } else if !primary_cwd.is_empty() {
-                                        format!("{}/{}", primary_cwd.trim_end_matches('/'), path)
+                                    } else if !conv_cwd.is_empty() {
+                                        format!("{}/{}", conv_cwd.trim_end_matches('/'), path)
                                     } else {
                                         path.to_string()
                                     };
@@ -577,5 +672,60 @@ mod tests {
         let mi = b.model_info.unwrap();
         assert_eq!(mi.get("modelName").and_then(|v| v.as_str()), Some("claude-3-5-sonnet"));
         assert!(b.context_window.is_some());
+    }
+
+    #[test]
+    fn fetch_composer_ids_from_conn_returns_ids() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ItemTable (key TEXT, value TEXT)").unwrap();
+        let data = r#"{"allComposers":[
+            {"composerId":"aaaa-1111","name":"Chat A"},
+            {"composerId":"bbbb-2222","name":"Chat B"}
+        ]}"#;
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('composer.composerData', ?1)",
+            rusqlite::params![data],
+        )
+        .unwrap();
+        let ids = fetch_composer_ids_from_conn(&conn);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"aaaa-1111".to_string()));
+        assert!(ids.contains(&"bbbb-2222".to_string()));
+    }
+
+    #[test]
+    fn fetch_composer_ids_from_conn_empty_when_no_key() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ItemTable (key TEXT, value TEXT)").unwrap();
+        let ids = fetch_composer_ids_from_conn(&conn);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn fetch_composer_ids_from_conn_empty_when_no_composers() {
+        let conn = SqliteConn::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ItemTable (key TEXT, value TEXT)").unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('composer.composerData', '{\"allComposers\":[]}')",
+            [],
+        )
+        .unwrap();
+        let ids = fetch_composer_ids_from_conn(&conn);
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn workspace_session_id_stable() {
+        let id1 = workspace_session_id("/home/user/project", 1234);
+        let id2 = workspace_session_id("/home/user/project", 9999);
+        // Same CWD → same session ID regardless of PID
+        assert_eq!(id1, id2);
+        assert!(id1.starts_with("cursor-"));
+    }
+
+    #[test]
+    fn workspace_session_id_fallback_on_empty_cwd() {
+        let id = workspace_session_id("", 5678);
+        assert_eq!(id, "cursor-5678");
     }
 }
