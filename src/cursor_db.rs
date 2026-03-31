@@ -426,8 +426,10 @@ pub async fn watch(state: Arc<AppState>) {
                     };
 
                     if let Err(e) = db::insert_request(&db, &req) {
-                        // Duplicate key is fine — just skip
+                        // Duplicate key — request already exists. Correct its session_id
+                        // in case it was previously attributed to the wrong workspace.
                         debug!("cursor_db: insert_request {bubble_id}: {e}");
+                        let _ = db::update_request_session(&db, &bubble_id, &session_id);
                     }
 
                     conv_user_bubbles

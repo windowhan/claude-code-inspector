@@ -294,6 +294,16 @@ pub fn update_request_body(conn: &Connection, id: &str, body: &str) -> Result<()
     Ok(())
 }
 
+/// Update the session_id for a request if it differs from the given value.
+/// Used to correct mis-attributed Cursor requests after workspace mapping improves.
+pub fn update_request_session(conn: &Connection, id: &str, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE requests SET session_id = ?1 WHERE id = ?2 AND (session_id != ?1 OR session_id IS NULL)",
+        params![session_id, id],
+    )?;
+    Ok(())
+}
+
 /// Update a Cursor user-bubble request with the AI response body and output token count.
 pub fn update_cursor_response(
     conn: &Connection,
@@ -1907,5 +1917,31 @@ mod tests {
 
         let result = find_pending_cursor_request_by_conversation(&conn, "conv-multi").unwrap();
         assert_eq!(result, Some("bubble-new".to_string()));
+    }
+
+    #[test]
+    fn update_request_session_corrects_wrong_session() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        upsert_session(&conn, &sample_session("s2")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        update_request_session(&conn, "r1", "s2").unwrap();
+
+        let reqs = get_requests(&conn, Some("s2"), None, 10, 0).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].session_id.as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn update_request_session_noop_when_already_correct() {
+        let conn = setup();
+        upsert_session(&conn, &sample_session("s1")).unwrap();
+        insert_request(&conn, &sample_request("r1", "s1")).unwrap();
+
+        update_request_session(&conn, "r1", "s1").unwrap();
+
+        let reqs = get_requests(&conn, Some("s1"), None, 10, 0).unwrap();
+        assert_eq!(reqs.len(), 1);
     }
 }
